@@ -11,6 +11,11 @@ from datetime import datetime, timezone
 
 import websockets
 
+try:
+    from arb_monitor import record_trade
+except ImportError:
+    def record_trade(p): pass
+
 
 @dataclass
 class SimState:
@@ -89,8 +94,9 @@ async def run(symbol: str):
                         state.fills += 1
                         if profit > 0:
                             state.wins += 1
+                        record_trade(profit)
                         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                        print(f"  [{ts}] FILL #{state.fills} pnl={profit:+.4f} | Total: ${state.pnl:+.4f} | Equity: ${state.equity:.2f} | WR: {state.wr}")
+                        print(f"  [{ts}] FILL #{state.fills} pnl={profit:+.4f} | Total: ${state.pnl:+.4f} | Equity: ${state.equity:.2f} | WR: {state.wr}", flush=True)
                     elif state.position > -MAX_POS_USD:
                         state.position -= ORDER_SIZE_USD
                         state.entry_price = my_ask
@@ -104,8 +110,9 @@ async def run(symbol: str):
                     state.fills += 1
                     if profit > 0:
                         state.wins += 1
+                    record_trade(profit)
                     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                    print(f"  [{ts}] FILL #{state.fills} pnl={profit:+.4f} | Total: ${state.pnl:+.4f} | Equity: ${state.equity:.2f} | WR: {state.wr}")
+                    print(f"  [{ts}] FILL #{state.fills} pnl={profit:+.4f} | Total: ${state.pnl:+.4f} | Equity: ${state.equity:.2f} | WR: {state.wr}", flush=True)
 
                 # Status every 30s
                 if last_mid == 0 or abs(mid - last_mid) / last_mid > 0.001:

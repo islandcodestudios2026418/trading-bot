@@ -110,8 +110,6 @@ def get_market_tokens() -> dict[str, dict]:
 async def monitor():
     """Main monitoring loop using WebSocket."""
     log("Starting Polymarket Arb Monitor...")
-    threading.Thread(target=start_web, daemon=True).start()
-    log(f"Dashboard at http://0.0.0.0:{os.getenv('PORT','8080')}")
 
     while True:
         try:
