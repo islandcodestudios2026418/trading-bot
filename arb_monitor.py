@@ -10,7 +10,9 @@ import json
 import os
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+TW_TZ = timezone(timedelta(hours=8))
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
@@ -19,7 +21,7 @@ import websockets
 
 # Equity tracking
 STARTING_CAPITAL = float(os.getenv("CAPITAL", "500"))
-equity_history: list[dict] = [{"ts": datetime.now(timezone.utc).isoformat(), "equity": STARTING_CAPITAL, "poly": 0, "binance": 0}]
+equity_history: list[dict] = [{"ts": datetime.now(TW_TZ).isoformat(), "equity": STARTING_CAPITAL, "poly": 0, "binance": 0}]
 _poly_pnl = 0.0
 _binance_pnl = 0.0
 
@@ -75,7 +77,7 @@ def record_trade(profit: float, source: str = "binance"):
     else:
         _binance_pnl += profit
     equity_history.append({
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": datetime.now(TW_TZ).isoformat(),
         "equity": round(STARTING_CAPITAL + _poly_pnl + _binance_pnl, 4),
         "poly": round(_poly_pnl, 4),
         "binance": round(_binance_pnl, 4),
@@ -83,7 +85,7 @@ def record_trade(profit: float, source: str = "binance"):
 
 
 def log(msg):
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    ts = datetime.now(TW_TZ).strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
 

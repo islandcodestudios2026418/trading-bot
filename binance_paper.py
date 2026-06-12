@@ -7,7 +7,9 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+TW_TZ = timezone(timedelta(hours=8))
 
 import websockets
 
@@ -85,7 +87,7 @@ async def run(symbol: str):
                         state.position -= ORDER_SIZE_USD
                         state.entry_price = prev_ask
                         state.fills += 1
-                        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                        ts = datetime.now(TW_TZ).strftime("%H:%M:%S")
                         print(f"  [{ts}] SELL @ {prev_ask:.6f} | pos=${state.position:.0f}", flush=True)
 
                     # Someone hit our bid (sold to us): new ask <= our prev bid
@@ -94,7 +96,7 @@ async def run(symbol: str):
                         state.position += ORDER_SIZE_USD
                         state.entry_price = prev_bid
                         state.fills += 1
-                        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                        ts = datetime.now(TW_TZ).strftime("%H:%M:%S")
                         print(f"  [{ts}] BUY  @ {prev_bid:.6f} | pos=${state.position:.0f}", flush=True)
 
                     # Close position for profit when price reverts
@@ -105,7 +107,7 @@ async def run(symbol: str):
                         if profit > 0: state.wins += 1
                         state.fills += 1
                         record_trade(profit)
-                        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                        ts = datetime.now(TW_TZ).strftime("%H:%M:%S")
                         print(f"  [{ts}] COVER pnl={profit:+.4f} | Total: ${state.pnl:+.4f} | Eq: ${state.equity:.2f} | WR: {state.wr}", flush=True)
                         state.position = 0
 
@@ -116,7 +118,7 @@ async def run(symbol: str):
                         if profit > 0: state.wins += 1
                         state.fills += 1
                         record_trade(profit)
-                        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                        ts = datetime.now(TW_TZ).strftime("%H:%M:%S")
                         print(f"  [{ts}] CLOSE pnl={profit:+.4f} | Total: ${state.pnl:+.4f} | Eq: ${state.equity:.2f} | WR: {state.wr}", flush=True)
                         state.position = 0
 
