@@ -3,9 +3,7 @@ Polymarket 24/7 Arbitrage Monitor — WebSocket based.
 Monitors all active binary markets for Yes_ask + No_ask < 1.0 opportunities.
 Designed to run on Zeabur (or any always-on server).
 
-Modes:
-- ALERT: prints/webhooks when arb found (default)
-- EXECUTE: auto-trades when arb found (needs wallet)
+Includes a web dashboard at port 8080 showing equity curve.
 """
 import asyncio
 import json
@@ -13,15 +11,65 @@ import os
 import time
 import traceback
 from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 import requests
 import websockets
+
+# Equity tracking
+STARTING_CAPITAL = float(os.getenv("CAPITAL", "500"))
+equity_history: list[dict] = [{"ts": datetime.now(timezone.utc).isoformat(), "equity": STARTING_CAPITAL}]
 
 GAMMA = "https://gamma-api.polymarket.com/markets"
 CLOB = "https://clob.polymarket.com/book"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # Discord/Telegram webhook
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.3"))  # minimum 0.3% profit to alert
+
+
+DASHBOARD_HTML = """<!DOCTYPE html><html><head><title>Arb Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script></head><body>
+<h2>Polymarket Arb Monitor — Equity Curve</h2>
+<canvas id="c" style="max-width:900px;max-height:400px"></canvas>
+<script>
+fetch('/data').then(r=>r.json()).then(d=>{
+new Chart(document.getElementById('c'),{type:'line',data:{
+labels:d.map(p=>p.ts.slice(11,19)),datasets:[{label:'Equity ($)',data:d.map(p=>p.equity),
+borderColor:'#10b981',fill:false,tension:0.3}]},
+options:{plugins:{legend:{display:false}},scales:{y:{beginAtZero:false}}}})})
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/data":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(equity_history[-500:]).encode())
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(DASHBOARD_HTML.encode())
+
+    def log_message(self, *args):
+        pass  # suppress request logs
+
+
+def start_web():
+    port = int(os.getenv("PORT", "8080"))
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+
+
+def record_trade(profit: float):
+    """Record a completed arb trade."""
+    last_eq = equity_history[-1]["equity"]
+    equity_history.append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "equity": round(last_eq + profit, 4),
+    })
 
 
 def log(msg):
@@ -62,6 +110,8 @@ def get_market_tokens() -> dict[str, dict]:
 async def monitor():
     """Main monitoring loop using WebSocket."""
     log("Starting Polymarket Arb Monitor...")
+    threading.Thread(target=start_web, daemon=True).start()
+    log(f"Dashboard at http://0.0.0.0:{os.getenv('PORT','8080')}")
 
     while True:
         try:
@@ -143,10 +193,13 @@ def check_arb(tid: str, best_asks: dict, token_pairs: dict):
     if total < 1.0:
         profit_pct = (1.0 - total) / total * 100
         if profit_pct >= MIN_PROFIT_PCT:
+            trade_size = min(100, STARTING_CAPITAL * 0.05)  # 5% of capital per trade
+            profit_usd = (1.0 - total) * trade_size
+            record_trade(profit_usd)
             send_alert(
                 f"ARB FOUND: {info['q']}\n"
                 f"  Yes={ask_a:.4f} + No={ask_b:.4f} = {total:.4f}\n"
-                f"  Profit: {profit_pct:.2f}% (${(1.0-total)*100:.2f} per $100)"
+                f"  Profit: {profit_pct:.2f}% (${profit_usd:.2f})"
             )
 
 
