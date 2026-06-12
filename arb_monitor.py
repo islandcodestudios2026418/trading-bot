@@ -19,7 +19,9 @@ import websockets
 
 # Equity tracking
 STARTING_CAPITAL = float(os.getenv("CAPITAL", "500"))
-equity_history: list[dict] = [{"ts": datetime.now(timezone.utc).isoformat(), "equity": STARTING_CAPITAL}]
+equity_history: list[dict] = [{"ts": datetime.now(timezone.utc).isoformat(), "equity": STARTING_CAPITAL, "poly": 0, "binance": 0}]
+_poly_pnl = 0.0
+_binance_pnl = 0.0
 
 GAMMA = "https://gamma-api.polymarket.com/markets"
 CLOB = "https://clob.polymarket.com/book"
@@ -28,16 +30,18 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # Discord/Telegram webhook
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.3"))  # minimum 0.3% profit to alert
 
 
-DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Arb Monitor</title>
+DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Trading Bot</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script></head><body>
-<h2>Polymarket Arb Monitor - Equity Curve</h2>
+<h2>Trading Bot - Equity Curve</h2>
 <canvas id="c" style="max-width:900px;max-height:400px"></canvas>
 <script>
 fetch('/data').then(r=>r.json()).then(d=>{
 new Chart(document.getElementById('c'),{type:'line',data:{
-labels:d.map(p=>p.ts.slice(11,19)),datasets:[{label:'Equity ($)',data:d.map(p=>p.equity),
-borderColor:'#10b981',fill:false,tension:0.3}]},
-options:{plugins:{legend:{display:false}},scales:{y:{beginAtZero:false}}}})})
+labels:d.map(p=>p.ts.slice(11,19)),datasets:[
+{label:'Total ($)',data:d.map(p=>p.equity),borderColor:'#10b981',fill:false,tension:0.3},
+{label:'Binance MM',data:d.map(p=>p.binance),borderColor:'#3b82f6',fill:false,tension:0.3},
+{label:'Polymarket Arb',data:d.map(p=>p.poly),borderColor:'#f59e0b',fill:false,tension:0.3}
+]},options:{scales:{y:{beginAtZero:false}}}})})
 </script></body></html>"""
 
 
@@ -63,12 +67,18 @@ def start_web():
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
-def record_trade(profit: float):
-    """Record a completed arb trade."""
-    last_eq = equity_history[-1]["equity"]
+def record_trade(profit: float, source: str = "binance"):
+    """Record a completed trade."""
+    global _poly_pnl, _binance_pnl
+    if source == "poly":
+        _poly_pnl += profit
+    else:
+        _binance_pnl += profit
     equity_history.append({
         "ts": datetime.now(timezone.utc).isoformat(),
-        "equity": round(last_eq + profit, 4),
+        "equity": round(STARTING_CAPITAL + _poly_pnl + _binance_pnl, 4),
+        "poly": round(_poly_pnl, 4),
+        "binance": round(_binance_pnl, 4),
     })
 
 
@@ -193,7 +203,7 @@ def check_arb(tid: str, best_asks: dict, token_pairs: dict):
         if profit_pct >= MIN_PROFIT_PCT:
             trade_size = min(100, STARTING_CAPITAL * 0.05)  # 5% of capital per trade
             profit_usd = (1.0 - total) * trade_size
-            record_trade(profit_usd)
+            record_trade(profit_usd, source="poly")
             send_alert(
                 f"ARB FOUND: {info['q']}\n"
                 f"  Yes={ask_a:.4f} + No={ask_b:.4f} = {total:.4f}\n"
