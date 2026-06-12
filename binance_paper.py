@@ -37,8 +37,8 @@ class SimState:
     def wr(self): return f"{self.wins/self.fills*100:.0f}%" if self.fills else "-"
 
 
-SPREAD_BPS = 50  # our spread: 0.5% (half each side = 0.25%)
-MAX_POS_USD = 50  # max $50 position
+SPREAD_BPS = 10  # our spread: 0.1% — tighter than market to get fills
+MAX_POS_USD = 50
 ORDER_SIZE_USD = 10
 
 
@@ -54,6 +54,8 @@ async def run(symbol: str):
     my_bid = 0.0
     my_ask = 0.0
     tick_count = 0
+    prev_bid = 0.0
+    prev_ask = 0.0
 
     async for ws in websockets.connect(ws_url, ssl=True):
         try:
@@ -64,62 +66,65 @@ async def run(symbol: str):
                 if best_bid <= 0 or best_ask <= 0:
                     continue
 
-                mid = (best_bid + best_ask) / 2
-                half_spread = mid * (SPREAD_BPS / 20000)
-
-                # Our quotes
-                my_bid = mid - half_spread
-                my_ask = mid + half_spread
                 tick_count += 1
+                mkt_spread = (best_ask - best_bid) / best_bid * 100
 
-                # Print status every 100 ticks
-                if tick_count % 100 == 1:
-                    mkt_spread = (best_ask - best_bid) / best_bid * 100
-                    print(f"  tick#{tick_count} mkt={best_bid}/{best_ask} spr={mkt_spread:.2f}% | my_bid={my_bid:.6f} my_ask={my_ask:.6f} | pos=${state.position:.0f} pnl=${state.pnl:+.4f}", flush=True)
+                # Our strategy: post at best_bid and best_ask (top of book maker)
+                # We get filled when price moves: new best_bid > our ask (prev_ask)
+                # or new best_ask < our bid (prev_bid)
+                my_bid = best_bid
+                my_ask = best_ask
 
-                # Simulate fill: market crosses our price
-                # Buy fill: market ask <= our bid (someone sells to us)
-                if best_ask <= my_bid and abs(state.position) < MAX_POS_USD:
-                    qty = ORDER_SIZE_USD / my_bid
-                    state.position += ORDER_SIZE_USD
-                    state.entry_price = my_bid
-                    state.fills += 1
+                if tick_count % 200 == 1:
+                    print(f"  tick#{tick_count} bid={best_bid} ask={best_ask} spr={mkt_spread:.3f}% | pos=${state.position:.0f} pnl=${state.pnl:+.4f} fills={state.fills}", flush=True)
 
-                # Sell fill: market bid >= our ask
-                if best_bid >= my_ask:
-                    if state.position > 0:
-                        profit = (my_ask - state.entry_price) / state.entry_price * ORDER_SIZE_USD
-                        state.pnl += profit
+                if prev_bid > 0:
+                    # Someone lifted our ask (bought from us): new bid >= our prev ask
+                    if best_bid >= prev_ask and state.position >= 0 and state.position < MAX_POS_USD:
+                        # We sold at prev_ask
                         state.position -= ORDER_SIZE_USD
+                        state.entry_price = prev_ask
                         state.fills += 1
-                        if profit > 0:
-                            state.wins += 1
+                        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                        print(f"  [{ts}] SELL @ {prev_ask:.6f} | pos=${state.position:.0f}", flush=True)
+
+                    # Someone hit our bid (sold to us): new ask <= our prev bid
+                    if best_ask <= prev_bid and state.position <= 0 and state.position > -MAX_POS_USD:
+                        # We bought at prev_bid
+                        state.position += ORDER_SIZE_USD
+                        state.entry_price = prev_bid
+                        state.fills += 1
+                        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                        print(f"  [{ts}] BUY  @ {prev_bid:.6f} | pos=${state.position:.0f}", flush=True)
+
+                    # Close position for profit when price reverts
+                    if state.position < 0 and best_ask <= state.entry_price * (1 - SPREAD_BPS/10000):
+                        # Cover short at lower price
+                        profit = (state.entry_price - best_ask) / state.entry_price * abs(state.position)
+                        state.pnl += profit
+                        if profit > 0: state.wins += 1
+                        state.fills += 1
                         record_trade(profit)
                         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                        print(f"  [{ts}] FILL #{state.fills} pnl={profit:+.4f} | Total: ${state.pnl:+.4f} | Equity: ${state.equity:.2f} | WR: {state.wr}", flush=True)
-                    elif state.position > -MAX_POS_USD:
-                        state.position -= ORDER_SIZE_USD
-                        state.entry_price = my_ask
+                        print(f"  [{ts}] COVER pnl={profit:+.4f} | Total: ${state.pnl:+.4f} | Eq: ${state.equity:.2f} | WR: {state.wr}", flush=True)
+                        state.position = 0
+
+                    if state.position > 0 and best_bid >= state.entry_price * (1 + SPREAD_BPS/10000):
+                        # Sell long at higher price
+                        profit = (best_bid - state.entry_price) / state.entry_price * state.position
+                        state.pnl += profit
+                        if profit > 0: state.wins += 1
                         state.fills += 1
+                        record_trade(profit)
+                        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                        print(f"  [{ts}] CLOSE pnl={profit:+.4f} | Total: ${state.pnl:+.4f} | Eq: ${state.equity:.2f} | WR: {state.wr}", flush=True)
+                        state.position = 0
 
-                # Buy back short
-                if state.position < 0 and best_ask <= my_bid:
-                    profit = (state.entry_price - my_bid) / state.entry_price * ORDER_SIZE_USD
-                    state.pnl += profit
-                    state.position += ORDER_SIZE_USD
-                    state.fills += 1
-                    if profit > 0:
-                        state.wins += 1
-                    record_trade(profit)
-                    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-                    print(f"  [{ts}] FILL #{state.fills} pnl={profit:+.4f} | Total: ${state.pnl:+.4f} | Equity: ${state.equity:.2f} | WR: {state.wr}", flush=True)
-
-                # Status every 30s
-                if last_mid == 0 or abs(mid - last_mid) / last_mid > 0.001:
-                    last_mid = mid
+                prev_bid = best_bid
+                prev_ask = best_ask
 
         except websockets.ConnectionClosed:
-            print("  Reconnecting...")
+            print("  Reconnecting...", flush=True)
             await asyncio.sleep(1)
 
 
