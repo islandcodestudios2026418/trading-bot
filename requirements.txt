@@ -1,0 +1,4 @@
+py-clob-client-v2==1.0.1
+polymarket-client
+python-dotenv==1.1.0
+websockets==15.0.1
