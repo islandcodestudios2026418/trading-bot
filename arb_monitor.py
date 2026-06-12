@@ -28,9 +28,9 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # Discord/Telegram webhook
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.3"))  # minimum 0.3% profit to alert
 
 
-DASHBOARD_HTML = """<!DOCTYPE html><html><head><title>Arb Monitor</title>
+DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Arb Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script></head><body>
-<h2>Polymarket Arb Monitor — Equity Curve</h2>
+<h2>Polymarket Arb Monitor - Equity Curve</h2>
 <canvas id="c" style="max-width:900px;max-height:400px"></canvas>
 <script>
 fetch('/data').then(r=>r.json()).then(d=>{
