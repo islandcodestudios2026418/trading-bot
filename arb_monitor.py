@@ -1,9 +1,8 @@
 """
-Polymarket 24/7 Arbitrage Monitor — WebSocket based.
-Monitors all active binary markets for Yes_ask + No_ask < 1.0 opportunities.
-Designed to run on Zeabur (or any always-on server).
-
-Includes a web dashboard at port 8080 showing equity curve.
+Polymarket 24/7 Arbitrage Monitor + Dashboard.
+/data — equity curve (backward-compatible)
+/stats — per-pair JSON stats for external monitoring
+/ — dashboard HTML
 """
 import asyncio
 import json
@@ -11,66 +10,31 @@ import os
 import time
 import traceback
 from datetime import datetime, timezone, timedelta
-
-TW_TZ = timezone(timedelta(hours=8))
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
 import requests
 import websockets
 
-# Equity tracking
-STARTING_CAPITAL = float(os.getenv("CAPITAL", "500"))
+TW_TZ = timezone(timedelta(hours=8))
+
+STARTING_CAPITAL = float(os.getenv("CAPITAL", "2000"))
 equity_history: list[dict] = [{"ts": datetime.now(TW_TZ).isoformat(), "equity": STARTING_CAPITAL, "poly": 0, "binance": 0}]
 _poly_pnl = 0.0
 _binance_pnl = 0.0
 
 GAMMA = "https://gamma-api.polymarket.com/markets"
-CLOB = "https://clob.polymarket.com/book"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # Discord/Telegram webhook
-MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.3"))  # minimum 0.3% profit to alert
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.3"))
 
 
-DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Trading Bot</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script></head><body>
-<h2>Trading Bot - Equity Curve</h2>
-<canvas id="c" style="max-width:900px;max-height:400px"></canvas>
-<script>
-fetch('/data').then(r=>r.json()).then(d=>{
-new Chart(document.getElementById('c'),{type:'line',data:{
-labels:d.map(p=>p.ts.slice(11,19)),datasets:[
-{label:'Total ($)',data:d.map(p=>p.equity),borderColor:'#10b981',fill:false,tension:0.3},
-{label:'Binance MM',data:d.map(p=>p.binance),borderColor:'#3b82f6',fill:false,tension:0.3},
-{label:'Polymarket Arb',data:d.map(p=>p.poly),borderColor:'#f59e0b',fill:false,tension:0.3}
-]},options:{scales:{y:{beginAtZero:false}}}})})
-</script></body></html>"""
-
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/data":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(equity_history[-500:]).encode())
-        else:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(DASHBOARD_HTML.encode())
-
-    def log_message(self, *args):
-        pass  # suppress request logs
-
-
-def start_web():
-    port = int(os.getenv("PORT", "8080"))
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+def log(msg):
+    ts = datetime.now(TW_TZ).strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 def record_trade(profit: float, source: str = "binance"):
-    """Record a completed trade."""
     global _poly_pnl, _binance_pnl
     if source == "poly":
         _poly_pnl += profit
@@ -84,9 +48,94 @@ def record_trade(profit: float, source: str = "binance"):
     })
 
 
-def log(msg):
-    ts = datetime.now(TW_TZ).strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+def _get_stats() -> dict:
+    """Build stats JSON from binance_paper pair_states."""
+    try:
+        from binance_paper import pair_states, daily_pnl, daily_fills, daily_wins
+    except ImportError:
+        return {"error": "binance_paper not loaded"}
+
+    pairs = {}
+    for sym, ps in pair_states.items():
+        pairs[sym] = {
+            "position": round(ps.position, 2),
+            "entry_price": ps.entry_price,
+            "pnl": round(ps.pnl, 4),
+            "fills": ps.fills,
+            "win_rate": ps.wr,
+            "ofi": round(ps.last_ofi, 3),
+            "spread_bps": round(ps.last_spread_bps, 1),
+            "atr": round(ps.last_atr, 6),
+            "paused": time.time() < ps.paused_until,
+        }
+    return {
+        "equity": round(STARTING_CAPITAL + _poly_pnl + _binance_pnl, 2),
+        "daily_pnl": round(daily_pnl, 4),
+        "daily_fills": daily_fills,
+        "daily_win_rate": f"{daily_wins/daily_fills*100:.0f}%" if daily_fills else "-",
+        "pairs": pairs,
+        "uptime_min": round((time.time() - equity_history[0].get("_start", time.time())) / 60),
+    }
+
+
+DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Trading Bot</title>
+<meta http-equiv="refresh" content="30">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;margin:20px}
+h2{color:#10b981}table{border-collapse:collapse;margin:10px 0}
+td,th{padding:4px 12px;border:1px solid #333;text-align:right}
+th{background:#2d2d44}.pos{color:#10b981}.neg{color:#ef4444}
+canvas{max-width:900px;max-height:350px;margin:20px 0}</style></head><body>
+<h2>Trading Bot — Multi-pair MM</h2>
+<div id="stats"></div>
+<canvas id="c"></canvas>
+<script>
+fetch('/stats').then(r=>r.json()).then(s=>{
+  let h='<p>Equity: $'+s.equity+' | Daily PnL: $'+s.daily_pnl+' | Fills: '+s.daily_fills+' | WR: '+s.daily_win_rate+'</p>';
+  h+='<table><tr><th>Pair</th><th>Position</th><th>PnL</th><th>Fills</th><th>WR</th><th>OFI</th><th>Spread</th><th>Status</th></tr>';
+  for(let[k,v] of Object.entries(s.pairs||{})){
+    let pc=v.pnl>=0?'pos':'neg';
+    h+='<tr><td>'+k+'</td><td class="'+(v.position>=0?'pos':'neg')+'">$'+v.position+'</td>';
+    h+='<td class="'+pc+'">$'+v.pnl.toFixed(4)+'</td><td>'+v.fills+'</td><td>'+v.win_rate+'</td>';
+    h+='<td>'+v.ofi+'</td><td>'+v.spread_bps.toFixed(1)+'bp</td>';
+    h+='<td>'+(v.paused?'⏸PAUSED':'✅')+'</td></tr>';}
+  h+='</table>';
+  document.getElementById('stats').innerHTML=h;});
+fetch('/data').then(r=>r.json()).then(d=>{
+  new Chart(document.getElementById('c'),{type:'line',data:{
+    labels:d.map(p=>p.ts.slice(11,19)),datasets:[
+    {label:'Total ($)',data:d.map(p=>p.equity),borderColor:'#10b981',fill:false,tension:0.3},
+    {label:'Binance MM',data:d.map(p=>p.binance),borderColor:'#3b82f6',fill:false,tension:0.3},
+    {label:'Polymarket',data:d.map(p=>p.poly),borderColor:'#f59e0b',fill:false,tension:0.3}
+  ]},options:{scales:{y:{beginAtZero:false}},plugins:{legend:{labels:{color:'#ccc'}}}}})});
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/data":
+            self._json(equity_history[-500:])
+        elif self.path == "/stats":
+            self._json(_get_stats())
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(DASHBOARD_HTML.encode())
+
+    def _json(self, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def log_message(self, *args):
+        pass
+
+
+def start_web():
+    port = int(os.getenv("PORT", "8080"))
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
 def send_alert(msg):
@@ -99,8 +148,7 @@ def send_alert(msg):
 
 
 def get_market_tokens() -> dict[str, dict]:
-    """Fetch all active binary markets and their token pairs."""
-    token_pairs = {}  # token_id -> {pair_token, question}
+    token_pairs = {}
     for offset in range(0, 1000, 200):
         r = requests.get(GAMMA, params={
             "closed": "false", "active": "true", "limit": "200", "offset": str(offset)
@@ -120,30 +168,21 @@ def get_market_tokens() -> dict[str, dict]:
 
 
 async def monitor():
-    """Main monitoring loop using WebSocket."""
     log("Starting Polymarket Arb Monitor...")
-
     while True:
         try:
-            # Refresh market list every cycle
             log("Fetching active markets...")
             token_pairs = get_market_tokens()
             all_tokens = list(set(token_pairs.keys()))
-            log(f"Monitoring {len(all_tokens)//2} binary markets ({len(all_tokens)} tokens)")
+            log(f"Monitoring {len(all_tokens)//2} binary markets")
 
-            # Track best asks per token
             best_asks: dict[str, float] = {}
-
-            # Subscribe in batches (WS might have limits)
             batch_size = 100
             for i in range(0, len(all_tokens), batch_size):
                 batch = all_tokens[i:i+batch_size]
-
                 async with websockets.connect(WS_URL) as ws:
                     await ws.send(json.dumps({
-                        "assets_ids": batch,
-                        "type": "market",
-                        "custom_feature_enabled": True,
+                        "assets_ids": batch, "type": "market",
                     }))
 
                     async def heartbeat():
@@ -152,65 +191,51 @@ async def monitor():
                             await asyncio.sleep(10)
 
                     hb = asyncio.create_task(heartbeat())
-                    deadline = time.time() + 300  # refresh markets every 5 min
+                    deadline = time.time() + 300
 
                     try:
                         async for raw in ws:
                             if time.time() > deadline:
                                 break
-
                             if raw == "PONG":
                                 continue
-
                             msg = json.loads(raw)
                             evt = msg.get("event_type")
-
                             if evt == "book":
                                 tid = msg.get("asset_id")
                                 asks = msg.get("asks", [])
                                 if asks and tid in token_pairs:
                                     best_asks[tid] = float(asks[0]["price"])
-                                    check_arb(tid, best_asks, token_pairs)
-
+                                    _check_arb(tid, best_asks, token_pairs)
                             elif evt == "price_change":
                                 for pc in msg.get("price_changes", []):
                                     tid = pc.get("asset_id")
                                     if tid in token_pairs and pc.get("best_ask"):
                                         best_asks[tid] = float(pc["best_ask"])
-                                        check_arb(tid, best_asks, token_pairs)
+                                        _check_arb(tid, best_asks, token_pairs)
                     finally:
                         hb.cancel()
-
         except Exception as e:
-            log(f"Error: {e}")
+            log(f"Polymarket error: {e}")
             traceback.print_exc()
             await asyncio.sleep(5)
 
 
-def check_arb(tid: str, best_asks: dict, token_pairs: dict):
-    """Check if Yes+No asks sum to less than 1.0."""
+def _check_arb(tid: str, best_asks: dict, token_pairs: dict):
     info = token_pairs.get(tid)
     if not info:
         return
     pair_tid = info["pair"]
     if tid not in best_asks or pair_tid not in best_asks:
         return
-
-    ask_a = best_asks[tid]
-    ask_b = best_asks[pair_tid]
-    total = ask_a + ask_b
-
+    total = best_asks[tid] + best_asks[pair_tid]
     if total < 1.0:
         profit_pct = (1.0 - total) / total * 100
         if profit_pct >= MIN_PROFIT_PCT:
-            trade_size = min(100, STARTING_CAPITAL * 0.05)  # 5% of capital per trade
+            trade_size = min(100, STARTING_CAPITAL * 0.05)
             profit_usd = (1.0 - total) * trade_size
             record_trade(profit_usd, source="poly")
-            send_alert(
-                f"ARB FOUND: {info['q']}\n"
-                f"  Yes={ask_a:.4f} + No={ask_b:.4f} = {total:.4f}\n"
-                f"  Profit: {profit_pct:.2f}% (${profit_usd:.2f})"
-            )
+            send_alert(f"ARB: {info['q']} | {total:.4f} | +${profit_usd:.2f}")
 
 
 if __name__ == "__main__":
