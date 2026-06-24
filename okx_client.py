@@ -122,6 +122,20 @@ def cancel_order(inst_id: str, order_id: str) -> dict:
     return _post("/api/v5/trade/cancel-order", {"instId": inst_id, "ordId": order_id})
 
 
+def batch_orders(orders: list[dict]) -> dict:
+    """Place up to 20 orders in a single API call.
+    Each order dict: {instId, tdMode, side, ordType, sz, px(optional), posSide(optional)}
+    """
+    return _post("/api/v5/trade/batch-orders", orders)
+
+
+def batch_cancel(orders: list[dict]) -> dict:
+    """Cancel up to 20 orders in a single API call.
+    Each order dict: {instId, ordId}
+    """
+    return _post("/api/v5/trade/cancel-batch-orders", orders)
+
+
 def cancel_all(inst_id: str) -> dict:
     orders = get_open_orders(inst_id)
     results = []

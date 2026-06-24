@@ -12,6 +12,7 @@ from binance_paper import run as binance_mm_run
 from okx_mm import run as okx_mm_run
 from funding_monitor import run as funding_run
 from cross_arb import run as cross_arb_run
+from tick_recorder import run as tick_recorder_run
 from telegram_alerts import daily_summary_loop, send as tg_send
 
 HEALTH_INTERVAL = 300  # log status every 5 min
@@ -65,6 +66,7 @@ async def main():
         supervised("OKX-MM", okx_mm_run),
         supervised("Funding", funding_run),
         supervised("Cross-Arb", cross_arb_run),
+        supervised("Tick-Recorder", tick_recorder_run),
         health_monitor(),
         daily_summary_loop(),
     )

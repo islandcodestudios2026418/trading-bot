@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .venv/
 stats.json
+tick_data/

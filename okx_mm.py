@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 import websockets
 
 from okx_client import (
-    scan_spreads, place_order, cancel_all, cancel_order,
+    scan_spreads, place_order, cancel_all, cancel_order, batch_orders, batch_cancel,
     get_balance, _sign, _ts, API_KEY, SECRET, PASSPHRASE, SIMULATED
 )
 from risk_manager import RiskManager
@@ -106,26 +106,28 @@ class OKXWSMarketMaker:
 
         cancel_all(inst_id)
 
-        r_bid = place_order(inst_id, "buy", qty_str, bid_px, "post_only")
-        r_ask = place_order(inst_id, "sell", qty_str, ask_px, "post_only")
+        # Batch place bid+ask simultaneously for lower latency
+        orders = [
+            {"instId": inst_id, "tdMode": "cash", "side": "buy", "ordType": "post_only", "sz": qty_str, "px": bid_px},
+            {"instId": inst_id, "tdMode": "cash", "side": "sell", "ordType": "post_only", "sz": qty_str, "px": ask_px},
+        ]
+        result = batch_orders(orders)
+        placed = 0
+        if result.get("code") == "0":
+            for i, r in enumerate(result.get("data", [])):
+                if r.get("sCode") == "0":
+                    placed += 1
+                    oid = r.get("ordId", "")
+                    side = "buy" if i == 0 else "sell"
+                    px = our_bid if i == 0 else our_ask
+                    if oid:
+                        self._orders[oid] = {"instId": inst_id, "side": side, "px": px, "sz": qty}
 
-        bid_ok = r_bid.get("code") == "0"
-        ask_ok = r_ask.get("code") == "0"
-
-        if bid_ok or ask_ok:
+        if placed > 0:
             self.rm.add_exposure(size_usd)
             self._last_quote_mid[inst_id] = mid
-            # Track order IDs for fill matching
-            if bid_ok:
-                oid = r_bid.get("data", [{}])[0].get("ordId", "")
-                if oid:
-                    self._orders[oid] = {"instId": inst_id, "side": "buy", "px": our_bid, "sz": qty}
-            if ask_ok:
-                oid = r_ask.get("data", [{}])[0].get("ordId", "")
-                if oid:
-                    self._orders[oid] = {"instId": inst_id, "side": "sell", "px": our_ask, "sz": qty}
-            log(f"[OKX-MM] {inst_id} bid={bid_px} ask={ask_px} sz=${size_usd:.0f} spd={spread_bps:.0f}bps")
-        return bid_ok or ask_ok
+            log(f"[OKX-MM] {inst_id} bid={bid_px} ask={ask_px} sz=${size_usd:.0f} spd={spread_bps:.0f}bps ({placed}/2 placed)")
+        return placed > 0
 
     def _process_fill(self, data: dict):
         """Process fill from private WS orders channel."""
