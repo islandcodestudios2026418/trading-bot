@@ -19,6 +19,12 @@ except ImportError:
     def record_trade(p): pass
     def log(m): print(m, flush=True)
 
+try:
+    from telegram_alerts import alert_trade, alert_kill
+except ImportError:
+    def alert_trade(*a): pass
+    def alert_kill(*a): pass
+
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",")]
 MAX_POS_USD = float(os.getenv("MAX_POS_USD", "100"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "50"))
@@ -53,6 +59,26 @@ daily_pnl: float = 0.0
 daily_fills: int = 0
 daily_wins: int = 0
 _halted = False
+_last_reset_date: str = ""
+
+
+async def daily_reset_loop():
+    """Reset daily stats at midnight TW time."""
+    global daily_pnl, daily_fills, daily_wins, _halted, _last_reset_date
+    while True:
+        now = datetime.now(TW_TZ)
+        today = now.strftime("%Y-%m-%d")
+        if now.hour == 0 and now.minute == 0 and _last_reset_date != today:
+            _last_reset_date = today
+            log(f"🔄 Daily reset — yesterday: fills={daily_fills} pnl=${daily_pnl:.4f}")
+            daily_pnl = 0.0
+            daily_fills = 0
+            daily_wins = 0
+            _halted = False
+            for ps in pair_states.values():
+                ps.consec_losses = 0
+                ps.paused_until = 0.0
+        await asyncio.sleep(30)
 
 
 def _halt_check() -> bool:
@@ -60,6 +86,7 @@ def _halt_check() -> bool:
     if daily_pnl <= -DAILY_LOSS_LIMIT:
         if not _halted:
             log(f"⛔ DAILY LOSS LIMIT hit: ${daily_pnl:.2f} <= -${DAILY_LOSS_LIMIT}")
+            alert_kill(f"Daily loss ${daily_pnl:.2f} <= -${DAILY_LOSS_LIMIT}")
             _halted = True
         return True
     return False
@@ -89,7 +116,11 @@ def _record(ps: PairState, profit: float):
         if ps.consec_losses >= CONSEC_LOSS_PAUSE:
             ps.paused_until = time.time() + PAUSE_SECONDS
             log(f"{ps.symbol} paused {PAUSE_SECONDS}s after {CONSEC_LOSS_PAUSE} consecutive losses")
+            alert_trade(ps.symbol, "PAUSED", profit, daily_pnl)
     record_trade(profit)
+    # Alert every 10th fill or on significant loss
+    if daily_fills % 10 == 0 or profit < -0.01:
+        alert_trade(ps.symbol, "FILL", profit, daily_pnl)
 
 
 async def run_pair(symbol: str):
@@ -151,20 +182,21 @@ async def run_pair(symbol: str):
                 else:
                     size = base_size
 
-                # OFI-biased entry: only enter in OFI direction
-                # OFI > 0.3 = strong bid pressure → buy bias
-                # OFI < -0.3 = strong ask pressure → sell bias
+                # OFI-biased entry with inventory skew (Avellaneda-Stoikov)
+                # When holding inventory, bias thresholds to favor unwinding
                 ofi_threshold = 0.3
+                inv_skew = (ps.position / MAX_POS_USD) * 0.2  # [-0.2, 0.2] skew
+                buy_thresh = ofi_threshold + inv_skew   # harder to buy when long
+                sell_thresh = -ofi_threshold + inv_skew  # easier to sell when long
 
                 if ps.position == 0:
-                    # Open position based on OFI
-                    if ps.last_ofi > ofi_threshold and abs(ps.position) < MAX_POS_USD:
+                    if ps.last_ofi > buy_thresh:
                         ps.position = size
-                        ps.entry_price = best_ask  # we buy at ask
+                        ps.entry_price = best_ask
                         log(f"[{symbol}] BUY ${size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f}")
-                    elif ps.last_ofi < -ofi_threshold and abs(ps.position) < MAX_POS_USD:
+                    elif ps.last_ofi < sell_thresh:
                         ps.position = -size
-                        ps.entry_price = best_bid  # we sell at bid
+                        ps.entry_price = best_bid
                         log(f"[{symbol}] SELL ${size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f}")
 
                 elif ps.position > 0:
@@ -181,6 +213,13 @@ async def run_pair(symbol: str):
                         _record(ps, profit)
                         log(f"[{symbol}] STOP_LONG ${profit:.4f} (total ${ps.pnl:.4f})")
                         ps.position = 0
+                    elif ps.last_ofi < sell_thresh:
+                        # OFI reversed strongly — flip to short
+                        profit = pnl_per_unit / ps.entry_price * ps.position
+                        _record(ps, profit)
+                        log(f"[{symbol}] FLIP_SHORT ${profit:.4f} OFI={ps.last_ofi:.2f}")
+                        ps.position = -size
+                        ps.entry_price = best_bid
 
                 elif ps.position < 0:
                     spread = best_ask - best_bid
@@ -195,6 +234,13 @@ async def run_pair(symbol: str):
                         _record(ps, profit)
                         log(f"[{symbol}] STOP_SHORT ${profit:.4f} (total ${ps.pnl:.4f})")
                         ps.position = 0
+                    elif ps.last_ofi > buy_thresh:
+                        # OFI reversed strongly — flip to long
+                        profit = pnl_per_unit / ps.entry_price * abs(ps.position)
+                        _record(ps, profit)
+                        log(f"[{symbol}] FLIP_LONG ${profit:.4f} OFI={ps.last_ofi:.2f}")
+                        ps.position = size
+                        ps.entry_price = best_ask
 
         except websockets.ConnectionClosed:
             log(f"[{symbol}] Reconnecting...")
@@ -204,7 +250,7 @@ async def run_pair(symbol: str):
 async def run():
     log(f"Multi-pair MM starting: {SYMBOLS}")
     log(f"  Max pos/pair: ${MAX_POS_USD}, Daily loss limit: -${DAILY_LOSS_LIMIT}, Capital: ${CAPITAL}")
-    await asyncio.gather(*[run_pair(s) for s in SYMBOLS])
+    await asyncio.gather(*[run_pair(s) for s in SYMBOLS], daily_reset_loop())
 
 
 if __name__ == "__main__":

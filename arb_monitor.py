@@ -19,6 +19,7 @@ import websockets
 TW_TZ = timezone(timedelta(hours=8))
 
 STARTING_CAPITAL = float(os.getenv("CAPITAL", "2000"))
+_start_time = time.time()
 equity_history: list[dict] = [{"ts": datetime.now(TW_TZ).isoformat(), "equity": STARTING_CAPITAL, "poly": 0, "binance": 0}]
 _poly_pnl = 0.0
 _binance_pnl = 0.0
@@ -27,6 +28,12 @@ GAMMA = "https://gamma-api.polymarket.com/markets"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 MIN_PROFIT_PCT = float(os.getenv("MIN_PROFIT_PCT", "0.3"))
+HTTPS_PROXY = os.getenv("HTTPS_PROXY", "")
+
+# Proxy config for requests
+_req_kwargs: dict = {"verify": False, "timeout": 10}
+if HTTPS_PROXY:
+    _req_kwargs["proxies"] = {"https": HTTPS_PROXY, "http": HTTPS_PROXY}
 
 
 def log(msg):
@@ -117,6 +124,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(equity_history[-500:])
         elif self.path == "/stats":
             self._json(_get_stats())
+        elif self.path == "/health":
+            uptime_s = time.time() - _start_time
+            self._json({"status": "ok", "uptime_s": int(uptime_s), "uptime_h": round(uptime_s / 3600, 1)})
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
@@ -150,10 +160,14 @@ def send_alert(msg):
 def get_market_tokens() -> dict[str, dict]:
     token_pairs = {}
     for offset in range(0, 1000, 200):
-        r = requests.get(GAMMA, params={
-            "closed": "false", "active": "true", "limit": "200", "offset": str(offset)
-        }, verify=False, timeout=10)
-        markets = r.json()
+        try:
+            r = requests.get(GAMMA, params={
+                "closed": "false", "active": "true", "limit": "200", "offset": str(offset)
+            }, **_req_kwargs)
+            markets = r.json()
+        except (requests.exceptions.JSONDecodeError, ValueError):
+            log("Polymarket API returned non-JSON (likely geo-blocked)")
+            return token_pairs
         if not markets:
             break
         for m in markets:
@@ -175,6 +189,10 @@ async def monitor():
             token_pairs = get_market_tokens()
             all_tokens = list(set(token_pairs.keys()))
             log(f"Monitoring {len(all_tokens)//2} binary markets")
+
+            if not all_tokens:
+                await asyncio.sleep(60)
+                continue
 
             best_asks: dict[str, float] = {}
             batch_size = 100
@@ -236,6 +254,11 @@ def _check_arb(tid: str, best_asks: dict, token_pairs: dict):
             profit_usd = (1.0 - total) * trade_size
             record_trade(profit_usd, source="poly")
             send_alert(f"ARB: {info['q']} | {total:.4f} | +${profit_usd:.2f}")
+            try:
+                from telegram_alerts import alert_arb
+                alert_arb(info['q'], total, profit_usd)
+            except ImportError:
+                pass
 
 
 if __name__ == "__main__":
