@@ -56,7 +56,7 @@ def record_trade(profit: float, source: str = "binance"):
 
 
 def _get_stats() -> dict:
-    """Build stats JSON from binance_paper pair_states."""
+    """Build stats JSON from all subsystems."""
     try:
         from binance_paper import pair_states, daily_pnl, daily_fills, daily_wins
     except ImportError:
@@ -71,42 +71,91 @@ def _get_stats() -> dict:
             "fills": ps.fills,
             "win_rate": ps.wr,
             "ofi": round(ps.last_ofi, 3),
+            "ofi_1s": round(ps.ofi_tracker.ofi_1s, 3),
+            "ofi_5s": round(ps.ofi_tracker.ofi_5s, 3),
+            "ofi_30s": round(ps.ofi_tracker.ofi_30s, 3),
+            "ofi_weights": [round(ps.ofi_tracker.w1, 2), round(ps.ofi_tracker.w5, 2), round(ps.ofi_tracker.w30, 2)],
             "spread_bps": round(ps.last_spread_bps, 1),
             "atr": round(ps.last_atr, 6),
+            "vwap_dev": round((ps.mid_prices[-1] - ps.vwap) / ps.vwap * 10000, 1) if ps.vwap and ps.mid_prices else 0,
             "paused": time.time() < ps.paused_until,
         }
+
+    # Funding arb positions
+    funding_arb = {}
+    try:
+        from funding_monitor import _arb_positions
+        for inst, pos in _arb_positions.items():
+            funding_arb[inst] = {
+                "perp_side": pos["perp_side"],
+                "size": pos["size"],
+                "entry_rate": pos["entry_rate"],
+                "hours_held": round((time.time() - pos["opened_at"]) / 3600, 1),
+            }
+    except (ImportError, Exception):
+        pass
+
+    # Cross-arb stats
+    cross = {}
+    try:
+        from cross_arb import _pnl as cross_pnl, _trades as cross_trades, _binance_mids, _okx_mids
+        cross = {"pnl": round(cross_pnl, 4), "trades": cross_trades}
+        for sym in _binance_mids:
+            b, o = _binance_mids.get(sym, 0), _okx_mids.get(sym, 0)
+            if b and o:
+                cross[sym] = {"div_bps": round((b - o) / o * 10000, 1)}
+    except (ImportError, Exception):
+        pass
+
     return {
         "equity": round(STARTING_CAPITAL + _poly_pnl + _binance_pnl, 2),
         "daily_pnl": round(daily_pnl, 4),
         "daily_fills": daily_fills,
         "daily_win_rate": f"{daily_wins/daily_fills*100:.0f}%" if daily_fills else "-",
         "pairs": pairs,
-        "uptime_min": round((time.time() - equity_history[0].get("_start", time.time())) / 60),
+        "funding_arb": funding_arb,
+        "cross_arb": cross,
+        "uptime_min": round((time.time() - _start_time) / 60),
     }
 
 
-DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Trading Bot</title>
+DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Trading Bot v6.1</title>
 <meta http-equiv="refresh" content="30">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;margin:20px}
-h2{color:#10b981}table{border-collapse:collapse;margin:10px 0}
+h2{color:#10b981}h3{color:#3b82f6;margin-top:20px}table{border-collapse:collapse;margin:10px 0}
 td,th{padding:4px 12px;border:1px solid #333;text-align:right}
-th{background:#2d2d44}.pos{color:#10b981}.neg{color:#ef4444}
+th{background:#2d2d44}.pos{color:#10b981}.neg{color:#ef4444}.dim{color:#888}
 canvas{max-width:900px;max-height:350px;margin:20px 0}</style></head><body>
-<h2>Trading Bot — Multi-pair MM</h2>
+<h2>Trading Bot v6.1 — Multi-Strategy</h2>
 <div id="stats"></div>
 <canvas id="c"></canvas>
 <script>
 fetch('/stats').then(r=>r.json()).then(s=>{
-  let h='<p>Equity: $'+s.equity+' | Daily PnL: $'+s.daily_pnl+' | Fills: '+s.daily_fills+' | WR: '+s.daily_win_rate+'</p>';
-  h+='<table><tr><th>Pair</th><th>Position</th><th>PnL</th><th>Fills</th><th>WR</th><th>OFI</th><th>Spread</th><th>Status</th></tr>';
+  let h='<p>Equity: $'+s.equity+' | Daily PnL: $'+s.daily_pnl+' | Fills: '+s.daily_fills+' | WR: '+s.daily_win_rate+' | Up: '+s.uptime_min+'m</p>';
+  h+='<h3>Binance MM (Multi-TF OFI + Mean Reversion)</h3>';
+  h+='<table><tr><th>Pair</th><th>Pos</th><th>PnL</th><th>Fills</th><th>WR</th><th>OFI</th><th>1s/5s/30s</th><th>Wts</th><th>VWAP</th><th>Spread</th><th>Status</th></tr>';
   for(let[k,v] of Object.entries(s.pairs||{})){
     let pc=v.pnl>=0?'pos':'neg';
     h+='<tr><td>'+k+'</td><td class="'+(v.position>=0?'pos':'neg')+'">$'+v.position+'</td>';
     h+='<td class="'+pc+'">$'+v.pnl.toFixed(4)+'</td><td>'+v.fills+'</td><td>'+v.win_rate+'</td>';
-    h+='<td>'+v.ofi+'</td><td>'+v.spread_bps.toFixed(1)+'bp</td>';
-    h+='<td>'+(v.paused?'⏸PAUSED':'✅')+'</td></tr>';}
+    h+='<td>'+v.ofi+'</td><td class="dim">'+v.ofi_1s+'/'+v.ofi_5s+'/'+v.ofi_30s+'</td>';
+    h+='<td class="dim">'+(v.ofi_weights||[]).join('/')+'</td>';
+    h+='<td>'+(v.vwap_dev||0)+'bp</td>';
+    h+='<td>'+v.spread_bps.toFixed(1)+'bp</td>';
+    h+='<td>'+(v.paused?'⏸':'✅')+'</td></tr>';}
   h+='</table>';
+  if(s.cross_arb&&s.cross_arb.trades>0){
+    h+='<h3>Cross-Exchange Arb (Binance→OKX)</h3>';
+    h+='<p>Trades: '+s.cross_arb.trades+' | PnL: $'+s.cross_arb.pnl+'</p>';
+    for(let[k,v] of Object.entries(s.cross_arb)){if(typeof v==='object'&&v.div_bps!==undefined)h+='<span class="dim">'+k+': '+v.div_bps+'bps </span>';}
+  }
+  if(Object.keys(s.funding_arb||{}).length>0){
+    h+='<h3>Funding Rate Arb</h3><table><tr><th>Instrument</th><th>Side</th><th>Entry Rate</th><th>Hours Held</th></tr>';
+    for(let[k,v] of Object.entries(s.funding_arb))
+      h+='<tr><td>'+k+'</td><td>'+v.perp_side+'</td><td>'+v.entry_rate.toFixed(4)+'%</td><td>'+v.hours_held+'h</td></tr>';
+    h+='</table>';
+  }
   document.getElementById('stats').innerHTML=h;});
 fetch('/data').then(r=>r.json()).then(d=>{
   new Chart(document.getElementById('c'),{type:'line',data:{

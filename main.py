@@ -10,6 +10,7 @@ from arb_monitor import start_web, monitor as polymarket_monitor, log
 from binance_paper import run as binance_mm_run
 from okx_mm import run as okx_mm_run
 from funding_monitor import run as funding_run
+from cross_arb import run as cross_arb_run
 from telegram_alerts import daily_summary_loop, send as tg_send
 
 HEALTH_INTERVAL = 300  # log status every 5 min
@@ -43,7 +44,7 @@ async def health_monitor():
 
 async def main():
     symbols = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT")
-    log(f"Starting: Polymarket Arb + Binance MM [{symbols}] + OKX MM")
+    log(f"Starting: Polymarket Arb + Binance MM [{symbols}] + OKX MM + Cross-Arb")
     tg_send(f"🚀 Bot starting: {symbols}")
     threading.Thread(target=start_web, daemon=True).start()
     log(f"Dashboard at http://0.0.0.0:{os.getenv('PORT', '8080')}")
@@ -52,6 +53,7 @@ async def main():
         supervised("Binance-MM", binance_mm_run),
         supervised("OKX-MM", okx_mm_run),
         supervised("Funding", funding_run),
+        supervised("Cross-Arb", cross_arb_run),
         health_monitor(),
         daily_summary_loop(),
     )

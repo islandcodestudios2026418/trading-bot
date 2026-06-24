@@ -35,16 +35,23 @@ PAUSE_SECONDS = 300
 
 @dataclass
 class OFITracker:
-    """Multi-timeframe OFI: exponential moving OFI at 1s/5s/30s."""
-    # EMA half-lives in seconds (at 100ms tick = 10/50/300 ticks)
+    """Multi-timeframe OFI: exponential moving OFI at 1s/5s/30s with adaptive weights."""
     ofi_1s: float = 0.0
     ofi_5s: float = 0.0
     ofi_30s: float = 0.0
     last_bid_vol: float = 0.0
     last_ask_vol: float = 0.0
-    _alpha_1s: float = 1 - 0.93  # ~10 tick half-life
-    _alpha_5s: float = 1 - 0.986  # ~50 tick half-life
-    _alpha_30s: float = 1 - 0.998  # ~300 tick half-life
+    _alpha_1s: float = 1 - 0.93
+    _alpha_5s: float = 1 - 0.986
+    _alpha_30s: float = 1 - 0.998
+    # Adaptive weights — start at 0.5/0.3/0.2, adjust based on win rates
+    w1: float = 0.5
+    w5: float = 0.3
+    w30: float = 0.2
+    # Win/loss counters per dominant timeframe
+    _wins: list = field(default_factory=lambda: [0, 0, 0])  # 1s, 5s, 30s
+    _losses: list = field(default_factory=lambda: [0, 0, 0])
+    _rebalance_count: int = 0
 
     def update(self, bid_vol: float, ask_vol: float) -> float:
         """Update with new depth snapshot. Returns weighted composite OFI."""
@@ -53,8 +60,38 @@ class OFITracker:
         self.ofi_1s += self._alpha_1s * (raw_ofi - self.ofi_1s)
         self.ofi_5s += self._alpha_5s * (raw_ofi - self.ofi_5s)
         self.ofi_30s += self._alpha_30s * (raw_ofi - self.ofi_30s)
-        # Weighted: short-term signal + trend confirmation
-        return 0.5 * self.ofi_1s + 0.3 * self.ofi_5s + 0.2 * self.ofi_30s
+        return self.w1 * self.ofi_1s + self.w5 * self.ofi_5s + self.w30 * self.ofi_30s
+
+    def dominant_tf(self) -> int:
+        """Which timeframe had the strongest signal at this moment? 0=1s, 1=5s, 2=30s."""
+        vals = [abs(self.ofi_1s), abs(self.ofi_5s), abs(self.ofi_30s)]
+        return vals.index(max(vals))
+
+    def record_outcome(self, win: bool):
+        """Record trade outcome for dominant timeframe at entry."""
+        tf = self.dominant_tf()
+        if win:
+            self._wins[tf] += 1
+        else:
+            self._losses[tf] += 1
+        self._rebalance_count += 1
+        # Rebalance every 50 trades
+        if self._rebalance_count >= 50:
+            self._rebalance()
+
+    def _rebalance(self):
+        """Shift weights toward timeframes with higher win rates."""
+        self._rebalance_count = 0
+        rates = []
+        for i in range(3):
+            total = self._wins[i] + self._losses[i]
+            rates.append(self._wins[i] / total if total >= 5 else 0.5)
+        # Softmax-style reweight
+        s = sum(rates)
+        if s > 0:
+            self.w1 = rates[0] / s
+            self.w5 = rates[1] / s
+            self.w30 = rates[2] / s
 
 
 @dataclass
@@ -139,6 +176,8 @@ def _record(ps: PairState, profit: float):
     ps.fills += 1
     daily_pnl += profit
     daily_fills += 1
+    # Adaptive OFI weight learning
+    ps.ofi_tracker.record_outcome(profit > 0)
     if profit > 0:
         ps.wins += 1
         daily_wins += 1
