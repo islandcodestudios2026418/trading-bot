@@ -31,6 +31,7 @@ DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "50"))
 CAPITAL = float(os.getenv("CAPITAL", "2000"))
 CONSEC_LOSS_PAUSE = 5
 PAUSE_SECONDS = 300
+STATS_FILE = os.getenv("STATS_FILE", "stats.json")
 
 
 @dataclass
@@ -115,6 +116,11 @@ class PairState:
     # Kelly sizing: track recent trade sizes
     _recent_wins: deque = field(default_factory=lambda: deque(maxlen=50))
     _recent_losses: deque = field(default_factory=lambda: deque(maxlen=50))
+    # Momentum: consecutive price direction counter
+    _momentum: int = 0  # +N = N consecutive up ticks, -N = down
+    _prev_mid: float = 0.0
+    # Trailing stop
+    _best_pnl: float = 0.0  # best unrealized PnL since entry
 
     @property
     def wr(self):
@@ -150,17 +156,50 @@ daily_fills: int = 0
 daily_wins: int = 0
 _halted = False
 _last_reset_date: str = ""
+_cumulative_pnl: float = 0.0
+_cumulative_fills: int = 0
+
+
+def _save_stats():
+    """Persist cumulative stats to JSON."""
+    data = {
+        "cumulative_pnl": _cumulative_pnl + daily_pnl,
+        "cumulative_fills": _cumulative_fills + daily_fills,
+        "per_pair": {sym: {"pnl": ps.pnl, "fills": ps.fills, "wins": ps.wins}
+                     for sym, ps in pair_states.items()},
+    }
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def _load_stats():
+    """Load cumulative stats from JSON on startup."""
+    global _cumulative_pnl, _cumulative_fills
+    try:
+        with open(STATS_FILE) as f:
+            data = json.load(f)
+        _cumulative_pnl = data.get("cumulative_pnl", 0)
+        _cumulative_fills = data.get("cumulative_fills", 0)
+        log(f"Loaded stats: cumulative PnL=${_cumulative_pnl:.4f}, fills={_cumulative_fills}")
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
 
 
 async def daily_reset_loop():
     """Reset daily stats at midnight TW time."""
-    global daily_pnl, daily_fills, daily_wins, _halted, _last_reset_date
+    global daily_pnl, daily_fills, daily_wins, _halted, _last_reset_date, _cumulative_pnl, _cumulative_fills
     while True:
         now = datetime.now(TW_TZ)
         today = now.strftime("%Y-%m-%d")
         if now.hour == 0 and now.minute == 0 and _last_reset_date != today:
             _last_reset_date = today
             log(f"🔄 Daily reset — yesterday: fills={daily_fills} pnl=${daily_pnl:.4f}")
+            _cumulative_pnl += daily_pnl
+            _cumulative_fills += daily_fills
+            _save_stats()
             daily_pnl = 0.0
             daily_fills = 0
             daily_wins = 0
@@ -252,6 +291,15 @@ async def run_pair(symbol: str):
                 ps.mid_prices.append(mid)
                 ps.last_spread_bps = (best_ask - best_bid) / mid * 10000
 
+                # Track momentum (consecutive directional ticks)
+                if ps._prev_mid > 0:
+                    if mid > ps._prev_mid:
+                        ps._momentum = max(1, ps._momentum + 1) if ps._momentum > 0 else 1
+                    elif mid < ps._prev_mid:
+                        ps._momentum = min(-1, ps._momentum - 1) if ps._momentum < 0 else -1
+                    # equal = keep current momentum
+                ps._prev_mid = mid
+
                 # Multi-timeframe OFI (1s/5s/30s weighted) with depth-weighted volumes
                 # Closer levels get exponentially more weight (decay=0.85)
                 bid_vol = sum(float(b[1]) * float(b[0]) * (0.85 ** i) for i, b in enumerate(bids))
@@ -305,57 +353,74 @@ async def run_pair(symbol: str):
                         sell_thresh *= 0.6  # easier to enter short
 
                 if ps.position == 0:
-                    if ps.last_ofi > buy_thresh:
+                    if ps.last_ofi > buy_thresh and ps._momentum >= 3:
                         ps.position = size
                         ps.entry_price = best_ask
-                        log(f"[{symbol}] BUY ${size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f}")
-                    elif ps.last_ofi < sell_thresh:
+                        log(f"[{symbol}] BUY ${size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f} mom={ps._momentum}")
+                    elif ps.last_ofi < sell_thresh and ps._momentum <= -3:
                         ps.position = -size
                         ps.entry_price = best_bid
-                        log(f"[{symbol}] SELL ${size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f}")
+                        log(f"[{symbol}] SELL ${size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f} mom={ps._momentum}")
 
                 elif ps.position > 0:
-                    # Long: take profit at 1 spread or stop at 2 spreads
+                    # ATR-based trailing stop + OFI flip
                     spread = best_ask - best_bid
                     pnl_per_unit = (best_bid - ps.entry_price)
-                    if pnl_per_unit >= spread * 0.8:
-                        profit = pnl_per_unit / ps.entry_price * ps.position
+                    unrealized = pnl_per_unit / ps.entry_price * ps.position
+                    ps._best_pnl = max(ps._best_pnl, unrealized)
+                    trail_dist = atr * 1.5 if atr > 0 else spread * 2
+                    drawdown_from_peak = ps._best_pnl - unrealized
+
+                    if ps._best_pnl > 0 and drawdown_from_peak > trail_dist / ps.entry_price * ps.position:
+                        # Trailing stop hit — lock in profit
+                        profit = unrealized
                         _record(ps, profit)
-                        log(f"[{symbol}] CLOSE_LONG +${profit:.4f} (total ${ps.pnl:.4f} wr={ps.wr})")
+                        log(f"[{symbol}] TRAIL_LONG +${profit:.4f} (peak ${ps._best_pnl:.4f} wr={ps.wr})")
                         ps.position = 0
-                    elif pnl_per_unit <= -spread * 2:
-                        profit = pnl_per_unit / ps.entry_price * ps.position
+                        ps._best_pnl = 0
+                    elif pnl_per_unit <= -trail_dist:
+                        # Hard stop at 1.5*ATR loss
+                        profit = unrealized
                         _record(ps, profit)
                         log(f"[{symbol}] STOP_LONG ${profit:.4f} (total ${ps.pnl:.4f})")
                         ps.position = 0
+                        ps._best_pnl = 0
                     elif ps.last_ofi < sell_thresh:
-                        # OFI reversed strongly — flip to short
-                        profit = pnl_per_unit / ps.entry_price * ps.position
+                        profit = unrealized
                         _record(ps, profit)
                         log(f"[{symbol}] FLIP_SHORT ${profit:.4f} OFI={ps.last_ofi:.2f}")
                         ps.position = -size
                         ps.entry_price = best_bid
+                        ps._best_pnl = 0
 
                 elif ps.position < 0:
+                    # ATR-based trailing stop + OFI flip
                     spread = best_ask - best_bid
                     pnl_per_unit = (ps.entry_price - best_ask)
-                    if pnl_per_unit >= spread * 0.8:
-                        profit = pnl_per_unit / ps.entry_price * abs(ps.position)
+                    unrealized = pnl_per_unit / ps.entry_price * abs(ps.position)
+                    ps._best_pnl = max(ps._best_pnl, unrealized)
+                    trail_dist = atr * 1.5 if atr > 0 else spread * 2
+                    drawdown_from_peak = ps._best_pnl - unrealized
+
+                    if ps._best_pnl > 0 and drawdown_from_peak > trail_dist / ps.entry_price * abs(ps.position):
+                        profit = unrealized
                         _record(ps, profit)
-                        log(f"[{symbol}] COVER_SHORT +${profit:.4f} (total ${ps.pnl:.4f} wr={ps.wr})")
+                        log(f"[{symbol}] TRAIL_SHORT +${profit:.4f} (peak ${ps._best_pnl:.4f} wr={ps.wr})")
                         ps.position = 0
-                    elif pnl_per_unit <= -spread * 2:
-                        profit = pnl_per_unit / ps.entry_price * abs(ps.position)
+                        ps._best_pnl = 0
+                    elif pnl_per_unit <= -trail_dist:
+                        profit = unrealized
                         _record(ps, profit)
                         log(f"[{symbol}] STOP_SHORT ${profit:.4f} (total ${ps.pnl:.4f})")
                         ps.position = 0
+                        ps._best_pnl = 0
                     elif ps.last_ofi > buy_thresh:
-                        # OFI reversed strongly — flip to long
-                        profit = pnl_per_unit / ps.entry_price * abs(ps.position)
+                        profit = unrealized
                         _record(ps, profit)
                         log(f"[{symbol}] FLIP_LONG ${profit:.4f} OFI={ps.last_ofi:.2f}")
                         ps.position = size
                         ps.entry_price = best_ask
+                        ps._best_pnl = 0
 
         except websockets.ConnectionClosed:
             log(f"[{symbol}] Reconnecting...")
@@ -363,6 +428,7 @@ async def run_pair(symbol: str):
 
 
 async def run():
+    _load_stats()
     log(f"Multi-pair MM starting: {SYMBOLS}")
     log(f"  Max pos/pair: ${MAX_POS_USD}, Daily loss limit: -${DAILY_LOSS_LIMIT}, Capital: ${CAPITAL}")
     await asyncio.gather(*[run_pair(s) for s in SYMBOLS], daily_reset_loop())
