@@ -79,9 +79,52 @@ def scan_extreme_rates() -> list[dict]:
 # Active arb positions: {instId: {"perp_side", "size", "entry_rate", "opened_at"}}
 _arb_positions: dict[str, dict] = {}
 
+# OKX funding settlement times: 00:00, 08:00, 16:00 UTC
+_FUNDING_HOURS = [0, 8, 16]
+TIMING_ENTRY_BEFORE_MIN = int(os.getenv("FUNDING_ENTRY_BEFORE_MIN", "60"))  # enter 60min before
+TIMING_EXIT_AFTER_MIN = int(os.getenv("FUNDING_EXIT_AFTER_MIN", "5"))  # exit 5min after
+
+
+def _minutes_to_next_settlement() -> int:
+    """Minutes until next OKX funding settlement."""
+    now = datetime.now(timezone.utc)
+    current_min_of_day = now.hour * 60 + now.minute
+    settlement_mins = [h * 60 for h in _FUNDING_HOURS]
+    # Find next settlement
+    for sm in settlement_mins:
+        if sm > current_min_of_day:
+            return sm - current_min_of_day
+    # Wrap to next day
+    return (24 * 60 - current_min_of_day) + settlement_mins[0]
+
+
+def _minutes_since_last_settlement() -> int:
+    """Minutes since last funding settlement."""
+    now = datetime.now(timezone.utc)
+    current_min_of_day = now.hour * 60 + now.minute
+    settlement_mins = [h * 60 for h in _FUNDING_HOURS]
+    # Find last settlement
+    for sm in reversed(settlement_mins):
+        if sm <= current_min_of_day:
+            return current_min_of_day - sm
+    # Wrap from previous day
+    return current_min_of_day + (24 * 60 - settlement_mins[-1])
+
+
+def _is_optimal_entry_window() -> bool:
+    """True if we're in the optimal entry window (T-60min to T-5min before settlement)."""
+    mins_to = _minutes_to_next_settlement()
+    return 5 <= mins_to <= TIMING_ENTRY_BEFORE_MIN
+
+
+def _is_post_settlement_exit() -> bool:
+    """True if we just passed a settlement (within exit window)."""
+    mins_since = _minutes_since_last_settlement()
+    return mins_since <= TIMING_EXIT_AFTER_MIN
+
 
 def _execute_arb_entry(inst_id: str, direction: str, rate_pct: float):
-    """Open funding arb: perp + spot hedge."""
+    """Open funding arb: perp + spot hedge. Timing-aware: prefer entry T-1h before settlement."""
     from okx_client import place_order, get_orderbook
 
     # Get spot instrument (e.g. BTC-USDT-SWAP → BTC-USDT)
@@ -150,17 +193,25 @@ async def run():
         try:
             extreme = scan_extreme_rates()
 
-            # Check exits first — close positions where rate normalized
+            # Check exits first — close if rate normalized OR post-settlement window
             for inst_id in list(_arb_positions.keys()):
                 current = next((e for e in extreme if e["instId"] == inst_id), None)
                 current_rate = current["rate_pct"] if current else 0
+                # Exit conditions: rate normalized OR just after settlement (captured the payment)
+                pos = _arb_positions[inst_id]
+                held_hours = (time.time() - pos["opened_at"]) / 3600
                 if abs(current_rate) < RATE_EXIT * 100:
                     _execute_arb_exit(inst_id, current_rate)
+                elif _is_post_settlement_exit() and held_hours >= 0.5:
+                    # Collected funding — exit to free capital
+                    _execute_arb_exit(inst_id, current_rate)
+                    log(f"[FUNDING-ARB] Timing exit: collected funding after settlement")
 
-            # Alert + optionally open new arbs
+            # Alert + optionally open new arbs (timing-aware)
             if extreme:
                 top = extreme[:5]
-                lines = [f"[FUNDING] {len(extreme)} extreme rates:"]
+                mins_to = _minutes_to_next_settlement()
+                lines = [f"[FUNDING] {len(extreme)} extreme rates (next settlement in {mins_to}min):"]
                 for e in top:
                     in_pos = "✅" if e["instId"] in _arb_positions else ""
                     lines.append(f"  {e['instId']}: {e['rate_pct']:+.4f}% ({e['apr']:+.0f}% APR) → {e['direction']} {in_pos}")
@@ -170,7 +221,14 @@ async def run():
                 if ARB_ENABLED:
                     best = top[0]
                     if best["instId"] not in _arb_positions and len(_arb_positions) < 3:
-                        _execute_arb_entry(best["instId"], best["direction"], best["rate_pct"])
+                        # Timing: prefer entry during optimal window (T-60min to T-5min)
+                        if _is_optimal_entry_window():
+                            _execute_arb_entry(best["instId"], best["direction"], best["rate_pct"])
+                            log(f"[FUNDING-ARB] Timed entry: {mins_to}min to settlement")
+                        elif abs(best["rate_pct"]) >= RATE_THRESHOLD * 3:
+                            # 3x threshold = exceptional rate, enter regardless of timing
+                            _execute_arb_entry(best["instId"], best["direction"], best["rate_pct"])
+                            log(f"[FUNDING-ARB] Exceptional rate entry: {best['rate_pct']:+.4f}%")
                 else:
                     best = top[0]
                     tg_send(

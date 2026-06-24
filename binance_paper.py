@@ -87,7 +87,28 @@ SESSION_PARAMS = {
 
 # Cross-pair correlation: shared OFI state
 _pair_ofi: dict[str, float] = {}  # symbol → last OFI
+_pair_returns: dict[str, deque] = {}  # symbol → recent returns for correlation
+_btc_eth_corr: float = 1.0  # rolling BTC-ETH return correlation
+_corr_window: int = 60  # number of returns for correlation calc
 _current_session: str = "europe"
+
+
+def _update_correlation():
+    """Compute rolling BTC-ETH return correlation. Decorrelation = alpha."""
+    global _btc_eth_corr
+    btc_r = _pair_returns.get("BTCUSDT")
+    eth_r = _pair_returns.get("ETHUSDT")
+    if not btc_r or not eth_r or len(btc_r) < 30 or len(eth_r) < 30:
+        return
+    n = min(len(btc_r), len(eth_r), _corr_window)
+    x = list(btc_r)[-n:]
+    y = list(eth_r)[-n:]
+    mx = sum(x) / n
+    my = sum(y) / n
+    cov = sum((a - mx) * (b - my) for a, b in zip(x, y)) / n
+    sx = (sum((a - mx) ** 2 for a in x) / n) ** 0.5
+    sy = (sum((b - my) ** 2 for b in y) / n) ** 0.5
+    _btc_eth_corr = cov / (sx * sy) if sx > 0 and sy > 0 else 1.0
 
 
 @dataclass
@@ -545,6 +566,15 @@ async def run_pair(symbol: str):
                 ps.mid_prices.append(mid)
                 ps.last_spread_bps = (best_ask - best_bid) / mid * 10000
 
+                # Track returns for BTC-ETH correlation
+                if ps._prev_mid > 0 and mid > 0:
+                    ret = (mid - ps._prev_mid) / ps._prev_mid
+                    if symbol not in _pair_returns:
+                        _pair_returns[symbol] = deque(maxlen=_corr_window)
+                    _pair_returns[symbol].append(ret)
+                    if symbol in ("BTCUSDT", "ETHUSDT"):
+                        _update_correlation()
+
                 # Track momentum (consecutive directional ticks)
                 if ps._prev_mid > 0:
                     if mid > ps._prev_mid:
@@ -624,6 +654,13 @@ async def run_pair(symbol: str):
                         buy_thresh *= 0.7  # correlated bullish → easier long
                     elif btc_ofi < -0.1 and eth_ofi < -0.1:
                         sell_thresh *= 0.7  # correlated bearish → easier short
+
+                # Decorrelation alpha: when BTC-ETH decouple (rho<0.5), trade the diverger harder
+                if _btc_eth_corr < 0.5 and symbol in ("BTCUSDT", "ETHUSDT"):
+                    # Pair-specific move — stronger conviction in the signal
+                    if abs(ps.last_ofi) > 0.2:
+                        buy_thresh *= 0.6
+                        sell_thresh *= 0.6
 
                 # Spread regime detection: tight (<5bp) → stricter, wide (>15bp) → relax
                 if ps.last_spread_bps < 5:
