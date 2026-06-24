@@ -43,20 +43,59 @@ def alert_arb(question: str, total_cost: float, profit_usd: float):
 
 
 async def daily_summary_loop():
-    """Send daily P&L summary at 23:59 TW time."""
+    """Send comprehensive daily P&L report at 23:59 TW time."""
     global _last_daily
     while True:
         now = datetime.now(TW_TZ)
-        # Send at 23:59
         if now.hour == 23 and now.minute == 59 and time.time() - _last_daily > 3600:
             _last_daily = time.time()
+            lines = [f"📊 <b>Daily Report</b> ({now.strftime('%Y-%m-%d')})"]
+
+            # Binance MM summary
             try:
-                from binance_paper import daily_pnl, daily_fills, daily_wins
+                from binance_paper import daily_pnl, daily_fills, daily_wins, pair_states
                 wr = f"{daily_wins/daily_fills*100:.0f}%" if daily_fills else "-"
-                send(
-                    f"📊 <b>Daily Summary</b> ({now.strftime('%Y-%m-%d')})\n"
-                    f"PnL: ${daily_pnl:.4f} | Fills: {daily_fills} | WR: {wr}"
-                )
+                lines.append(f"\n<b>Binance MM:</b> ${daily_pnl:.4f} | {daily_fills} fills | WR {wr}")
+                for sym, ps in pair_states.items():
+                    if ps.fills > 0:
+                        swr = f"{ps.wins/ps.fills*100:.0f}%"
+                        lines.append(f"  {sym}: ${ps.pnl:.4f} ({ps.fills}f, {swr})")
             except Exception:
                 pass
+
+            # OKX MM
+            try:
+                from okx_mm import OKXWSMarketMaker
+                # Note: we can't easily access the running instance, log what we can
+            except Exception:
+                pass
+
+            # Regime breakdown
+            try:
+                from binance_paper import pair_states
+                from regime import TRENDING, RANGING, NEUTRAL
+                regime_agg = {TRENDING: 0.0, RANGING: 0.0, NEUTRAL: 0.0}
+                for ps in pair_states.values():
+                    for r in (TRENDING, RANGING, NEUTRAL):
+                        regime_agg[r] += ps.regime.regime_pnl.get(r, 0.0)
+                lines.append(f"\n<b>By Regime:</b>")
+                for r, pnl in regime_agg.items():
+                    lines.append(f"  {r}: ${pnl:.4f}")
+            except Exception:
+                pass
+
+            # Signal attribution
+            try:
+                from signal_attrib import attrib
+                report = attrib.get_report()
+                if report:
+                    lines.append(f"\n<b>Signal Attribution (top):</b>")
+                    sorted_sigs = sorted(report.items(), key=lambda x: x[1]["total_pnl"], reverse=True)
+                    for sig, data in sorted_sigs[:5]:
+                        status = "✅" if data["enabled"] else "❌"
+                        lines.append(f"  {status} {sig}: ${data['total_pnl']:.4f} ({data['count']}t)")
+            except Exception:
+                pass
+
+            send("\n".join(lines))
         await asyncio.sleep(30)

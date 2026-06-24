@@ -353,6 +353,35 @@ class OKXWSMarketMaker:
             self._scan_pairs()
             await asyncio.sleep(SCAN_INTERVAL * 60)
 
+    async def _reconcile_loop(self):
+        """Periodically reconcile internal state with exchange positions."""
+        await asyncio.sleep(60)  # wait for initial fills
+        while True:
+            try:
+                from okx_client import _get
+                data = _get("/api/v5/account/positions", {"instType": "SPOT"})
+                exchange_pos = {}
+                for p in data.get("data", []):
+                    inst = p.get("instId", "")
+                    qty = float(p.get("pos", 0))
+                    if abs(qty) > 0:
+                        exchange_pos[inst] = qty
+                # Compare with internal state
+                for inst, inv in self._inv.items():
+                    internal_qty = inv.get("qty", 0)
+                    exchange_qty = exchange_pos.get(inst, 0)
+                    drift = abs(internal_qty - exchange_qty)
+                    mid = self._books.get(inst, {}).get("mid", 1)
+                    drift_usd = drift * mid
+                    if drift_usd > 5:  # > $5 drift = significant
+                        log(f"[OKX-MM] ⚠️ DRIFT {inst}: internal={internal_qty:.6f} exchange={exchange_qty:.6f} (${drift_usd:.2f})")
+                        tg_send(f"⚠️ Position drift: {inst}\nInternal: {internal_qty:.6f}\nExchange: {exchange_qty:.6f}\nDrift: ${drift_usd:.2f}")
+                        # Correct internal state to match exchange
+                        inv["qty"] = exchange_qty
+            except Exception as e:
+                log(f"[OKX-MM] Reconcile error: {e}")
+            await asyncio.sleep(300)  # check every 5 min
+
 
 async def run():
     """Main OKX MM — WebSocket-based."""
@@ -375,6 +404,7 @@ async def run():
         mm._ws_private(),
         mm._requote_loop(),
         mm._scan_loop(),
+        mm._reconcile_loop(),
     )
 
 

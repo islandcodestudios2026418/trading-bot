@@ -1,13 +1,86 @@
 """
-Risk management module — drawdown limits, position sizing, kill switch.
+Risk management module — drawdown limits, position sizing, kill switch, circuit breaker.
 Must be checked before every trade.
 """
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 
 TW_TZ = timezone(timedelta(hours=8))
+
+
+@dataclass
+class CircuitBreaker:
+    """Auto-pauses trading on rapid adverse conditions.
+    Triggers: rapid losses, API errors, or fast equity drops.
+    """
+    # Config
+    max_losses_per_min: int = 3  # 3+ consecutive losses in <60s = flash crash
+    max_api_errors_30s: int = 5  # API degradation
+    max_equity_drop_pct: float = 3.0  # 3% equity drop in 5 min
+    pause_duration: int = 300  # pause for 5 minutes after trigger
+
+    # State
+    _loss_times: deque = field(default_factory=lambda: deque(maxlen=10))
+    _error_times: deque = field(default_factory=lambda: deque(maxlen=20))
+    _equity_history: deque = field(default_factory=lambda: deque(maxlen=60))  # 5min at 5s intervals
+    tripped: bool = False
+    trip_reason: str = ""
+    trip_time: float = 0.0
+
+    def record_loss(self):
+        """Record a losing trade."""
+        self._loss_times.append(time.time())
+
+    def record_api_error(self):
+        """Record an API error."""
+        self._error_times.append(time.time())
+
+    def record_equity(self, equity: float):
+        """Record current equity for drawdown detection."""
+        self._equity_history.append((time.time(), equity))
+
+    def check(self) -> tuple[bool, str]:
+        """Check if circuit breaker should trip. Returns (ok, reason)."""
+        if self.tripped:
+            # Auto-reset after pause duration
+            if time.time() - self.trip_time > self.pause_duration:
+                self.tripped = False
+                self.trip_reason = ""
+                return True, "OK (breaker reset)"
+            return False, f"CIRCUIT BREAKER: {self.trip_reason} ({int(self.pause_duration - (time.time() - self.trip_time))}s left)"
+
+        now = time.time()
+
+        # Check rapid losses (3+ in 60s)
+        recent_losses = sum(1 for t in self._loss_times if now - t < 60)
+        if recent_losses >= self.max_losses_per_min:
+            self._trip(f"Rapid losses: {recent_losses} in 60s")
+            return False, self.trip_reason
+
+        # Check API errors (5+ in 30s)
+        recent_errors = sum(1 for t in self._error_times if now - t < 30)
+        if recent_errors >= self.max_api_errors_30s:
+            self._trip(f"API errors: {recent_errors} in 30s")
+            return False, self.trip_reason
+
+        # Check fast equity drop (3% in 5 min)
+        if len(self._equity_history) >= 2:
+            oldest = self._equity_history[0]
+            if now - oldest[0] <= 300 and oldest[1] > 0:  # within 5 min window
+                drop_pct = (oldest[1] - self._equity_history[-1][1]) / oldest[1] * 100
+                if drop_pct >= self.max_equity_drop_pct:
+                    self._trip(f"Equity drop: {drop_pct:.1f}% in {(now - oldest[0]) / 60:.1f}min")
+                    return False, self.trip_reason
+
+        return True, "OK"
+
+    def _trip(self, reason: str):
+        self.tripped = True
+        self.trip_reason = reason
+        self.trip_time = time.time()
 
 
 @dataclass
@@ -27,6 +100,7 @@ class RiskManager:
     last_loss_time: float = 0.0
     killed: bool = False
     kill_reason: str = ""
+    circuit_breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
 
     def __post_init__(self):
         self.peak_equity = self.capital
@@ -49,6 +123,11 @@ class RiskManager:
         """Check if trading is allowed. Returns (allowed, reason)."""
         if self.killed:
             return False, f"KILLED: {self.kill_reason}"
+
+        # Circuit breaker check
+        cb_ok, cb_reason = self.circuit_breaker.check()
+        if not cb_ok:
+            return False, cb_reason
 
         # Drawdown kill switch
         if self.drawdown_pct >= self.max_drawdown_pct:
@@ -85,11 +164,14 @@ class RiskManager:
         if pnl < 0:
             self.consecutive_losses += 1
             self.last_loss_time = time.time()
+            self.circuit_breaker.record_loss()
         else:
             self.consecutive_losses = 0
         # Update peak
         if self.equity > self.peak_equity:
             self.peak_equity = self.equity
+        # Record equity for circuit breaker
+        self.circuit_breaker.record_equity(self.equity)
 
     def add_exposure(self, amount: float):
         self.total_exposure += abs(amount)
