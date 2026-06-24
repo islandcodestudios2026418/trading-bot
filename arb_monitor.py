@@ -280,6 +280,8 @@ def _get_metrics() -> dict:
                 "institutional_flow": round(ot.institutional_flow, 3),
                 "depth_pressure": round(ot.depth_pressure, 4),
                 "spoof_score": round(ot.spoof_score, 3),
+                "kyle_lambda": round(ot.kyle_lambda, 4),
+                "micro_state": ot.micro_state,
                 "regime": ps.regime.regime,
                 "vr": round(ps.regime.vr, 3),
                 "hurst": round(ps.regime.hurst, 3),

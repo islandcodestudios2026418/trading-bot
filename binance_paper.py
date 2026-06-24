@@ -131,6 +131,10 @@ class OFITracker:
     arrival_intensity: float = 1.0  # current_rate / baseline_rate, >2.0 = informed surge
     # Order book imbalance (OBI): shallow levels 1-5
     obi: float = 0.0  # [-1,+1]: +1 = all bids, useful as alpha confirmation
+    # Market impact estimator: Kyle's lambda
+    _adv_ema: float = 0.0  # average daily volume (USD) EMA
+    _adv_alpha: float = 0.001  # slow-moving EMA
+    kyle_lambda: float = 0.0  # price impact per unit volume (bps per $)
     # Depth pressure gradient
     depth_pressure: float = 0.0  # >0 = bid wall (support), <0 = ask wall (resistance)
     # Quote stuffing/spoofing detection
@@ -139,6 +143,11 @@ class OFITracker:
     _last_bid_top: float = 0.0
     _last_ask_top: float = 0.0
     spoof_score: float = 0.0  # 0-1, >0.5 = likely spoofing detected
+    # Microstructure state machine
+    # States: normal, volatile, thin, squeeze
+    micro_state: str = "normal"
+    _spread_ema: float = 0.0  # EMA of spread_bps for state detection
+    _spread_alpha: float = 0.02
 
     def update(self, bid_vol: float, ask_vol: float) -> float:
         """Update with new depth snapshot. Returns weighted composite OFI."""
@@ -150,7 +159,7 @@ class OFITracker:
         return self.w1 * self.ofi_1s + self.w5 * self.ofi_5s + self.w30 * self.ofi_30s
 
     def update_depth_gradient(self, bids: list, asks: list):
-        """Compute depth pressure gradient + OBI from full orderbook."""
+        """Compute depth pressure gradient + OBI + market impact from full orderbook."""
         if len(bids) < 10 or len(asks) < 10:
             return
         # OBI: shallow levels 1-5 volume imbalance
@@ -158,6 +167,20 @@ class OFITracker:
         shallow_ask = sum(float(a[1]) * float(a[0]) for a in asks[:5])
         raw_obi = (shallow_bid - shallow_ask) / (shallow_bid + shallow_ask) if (shallow_bid + shallow_ask) > 0 else 0
         self.obi += 0.1 * (raw_obi - self.obi)  # smooth
+
+        # Kyle's lambda: estimate price impact from book depth
+        # Lambda ≈ spread / (2 * depth_at_best_5_levels_USD)
+        mid = (float(bids[0][0]) + float(asks[0][0])) / 2
+        spread_bps = (float(asks[0][0]) - float(bids[0][0])) / mid * 10000
+        total_depth = shallow_bid + shallow_ask
+        if total_depth > 0 and mid > 0:
+            # Impact: bps per $1000 traded
+            raw_lambda = spread_bps / (total_depth / 1000)
+            self.kyle_lambda += 0.05 * (raw_lambda - self.kyle_lambda)
+
+        # Update ADV estimate from cumulative depth
+        self._adv_ema += self._adv_alpha * (total_depth - self._adv_ema)
+
         # Shallow: levels 0-4, Deep: levels 5-19
         deep_bid = sum(float(b[1]) * float(b[0]) for b in bids[5:])
         deep_ask = sum(float(a[1]) * float(a[0]) for a in asks[5:])
@@ -188,6 +211,26 @@ class OFITracker:
             self.spoof_score = min(1.0, self.spoof_score + 0.3)
         else:
             self.spoof_score *= 0.9  # decay
+
+        # Microstructure state machine: detect market phase
+        mid = (float(bids[0][0]) + float(asks[0][0])) / 2
+        spread_bps_now = (float(asks[0][0]) - float(bids[0][0])) / mid * 10000 if mid > 0 else 0
+        self._spread_ema += self._spread_alpha * (spread_bps_now - self._spread_ema)
+        # States:
+        #   normal: spread near average, depth adequate
+        #   volatile: spread > 3x average (news event / flash move)
+        #   thin: depth dropped > 60% from normal (withdrawn liquidity)
+        #   squeeze: spread tight + high arrival rate (short squeeze / momentum)
+        if self._spread_ema > 0:
+            spread_ratio = spread_bps_now / self._spread_ema
+            if spread_ratio > 3.0:
+                self.micro_state = "volatile"
+            elif total_depth < self._adv_ema * 0.4 and self._adv_ema > 0:
+                self.micro_state = "thin"
+            elif spread_ratio < 0.5 and self.arrival_intensity > 2.5:
+                self.micro_state = "squeeze"
+            else:
+                self.micro_state = "normal"
 
     def update_trade(self, qty_usd: float, is_buyer_maker: bool, ts_ms: float = 0):
         """Update trade flow from aggTrade stream + detect institutional splitting + VPIN."""
@@ -629,6 +672,22 @@ async def run_pair(symbol: str):
                 # Spread-adaptive: no edge if spread is too tight
                 if ps.last_spread_bps < 1.0:
                     continue  # sub-1bp spread = no edge, skip tick
+
+                # Market impact filter: skip if our trade would move market > expected edge
+                impact_bps = ps.ofi_tracker.kyle_lambda * (size / 1000)  # bps impact for our size
+                if impact_bps > ps.last_spread_bps * 0.5:
+                    continue  # impact exceeds half the spread — negative edge
+
+                # Microstructure state adaptation
+                micro = ps.ofi_tracker.micro_state
+                if micro == "volatile":
+                    buy_thresh *= 2.0  # very cautious in volatile markets
+                    sell_thresh *= 2.0
+                elif micro == "thin":
+                    continue  # skip — withdrawn liquidity, danger of being picked off
+                elif micro == "squeeze":
+                    buy_thresh *= 0.5  # go with momentum in squeezes
+                    sell_thresh *= 0.5
 
                 # Depth pressure gradient: bid wall = easier long, ask wall = easier short
                 dp = ps.ofi_tracker.depth_pressure
