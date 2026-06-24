@@ -148,6 +148,23 @@ def cancel_order(inst_id: str, order_id: str) -> dict:
     return _post("/api/v5/trade/cancel-order", {"instId": inst_id, "ordId": order_id})
 
 
+def amend_order(inst_id: str, order_id: str, new_px: str = None, new_sz: str = None) -> dict:
+    """Amend an existing order's price and/or size (lower latency than cancel+replace)."""
+    body = {"instId": inst_id, "ordId": order_id}
+    if new_px:
+        body["newPx"] = new_px
+    if new_sz:
+        body["newSz"] = new_sz
+    return _post("/api/v5/trade/amend-order", body)
+
+
+def batch_amend(orders: list[dict]) -> dict:
+    """Amend up to 20 orders in one API call.
+    Each: {instId, ordId, newPx(optional), newSz(optional)}
+    """
+    return _post("/api/v5/trade/amend-batch-orders", orders)
+
+
 def batch_orders(orders: list[dict]) -> dict:
     """Place up to 20 orders in a single API call.
     Each order dict: {instId, tdMode, side, ordType, sz, px(optional), posSide(optional)}

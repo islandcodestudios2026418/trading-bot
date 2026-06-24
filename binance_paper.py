@@ -13,6 +13,11 @@ import websockets
 
 from regime import RegimeDetector
 
+try:
+    from signal_attrib import attrib
+except ImportError:
+    attrib = None
+
 TW_TZ = timezone(timedelta(hours=8))
 
 try:
@@ -309,6 +314,7 @@ class PairState:
     _entry_time: float = 0.0  # time.time() of position entry
     _highest_mid: float = 0.0  # highest mid since entry (chandelier long)
     _lowest_mid: float = 999999.0  # lowest mid since entry (chandelier short)
+    _entry_signals: dict = field(default_factory=dict)  # signal attribution snapshot
     # Regime detection
     regime: RegimeDetector = field(default_factory=RegimeDetector)
 
@@ -440,6 +446,9 @@ def _record(ps: PairState, profit: float):
         ps._recent_losses.append(net_profit)
     # Adaptive OFI weight learning
     ps.ofi_tracker.record_outcome(net_profit > 0)
+    # Signal attribution: attribute PnL to signals active at entry
+    if attrib and ps._entry_signals:
+        attrib.record_exit(ps._entry_signals, net_profit)
     # Regime analytics
     ps.regime.record_fill(net_profit)
     if net_profit > 0:
@@ -670,6 +679,15 @@ async def run_pair(symbol: str):
                         ps._entry_time = time.time()
                         ps._highest_mid = mid
                         ps._lowest_mid = 999999
+                        # Signal attribution: snapshot active signals at entry
+                        sigs = {"ofi": ps.last_ofi, "regime": ps.regime.regime}
+                        if obi > 0.15: sigs["obi"] = obi
+                        if vpin < 0.5: sigs["vpin_safe"] = vpin
+                        if ps.ofi_tracker.arrival_intensity > 2.0: sigs["arrival"] = ps.ofi_tracker.arrival_intensity
+                        if ps.ofi_tracker.volume_surge > 3.0: sigs["vol_surge"] = ps.ofi_tracker.volume_surge
+                        if inst_flow > 0.5: sigs["inst_flow"] = inst_flow
+                        if dp > 0.2: sigs["depth_press"] = dp
+                        ps._entry_signals = sigs
                         _track_exec(symbol, best_ask, mid, "buy")
                         log(f"[{symbol}] BUY ${adj_size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
                     elif ps.last_ofi < sell_thresh and ps._momentum <= -mom_req and tox_confirms_sell and signal_stable:
@@ -680,6 +698,15 @@ async def run_pair(symbol: str):
                         ps._entry_time = time.time()
                         ps._highest_mid = 0
                         ps._lowest_mid = mid
+                        # Signal attribution: snapshot active signals at entry
+                        sigs = {"ofi": ps.last_ofi, "regime": ps.regime.regime}
+                        if obi < -0.15: sigs["obi"] = obi
+                        if vpin < 0.5: sigs["vpin_safe"] = vpin
+                        if ps.ofi_tracker.arrival_intensity > 2.0: sigs["arrival"] = ps.ofi_tracker.arrival_intensity
+                        if ps.ofi_tracker.volume_surge > 3.0: sigs["vol_surge"] = ps.ofi_tracker.volume_surge
+                        if inst_flow > 0.5: sigs["inst_flow"] = inst_flow
+                        if dp < -0.2: sigs["depth_press"] = dp
+                        ps._entry_signals = sigs
                         _track_exec(symbol, best_bid, mid, "sell")
                         log(f"[{symbol}] SELL ${adj_size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
 

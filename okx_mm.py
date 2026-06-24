@@ -14,6 +14,7 @@ import websockets
 
 from okx_client import (
     scan_spreads, place_order, cancel_all, cancel_order, batch_orders, batch_cancel,
+    amend_order, batch_amend,
     get_balance, _sign, _ts, API_KEY, SECRET, PASSPHRASE, SIMULATED
 )
 from risk_manager import RiskManager
@@ -157,9 +158,43 @@ class OKXWSMarketMaker:
         else:
             qty_str, bid_px, ask_px = f"{qty:.0f}", f"{our_bid:.6f}", f"{our_ask:.6f}"
 
-        cancel_all(inst_id)
+        # Amend-first strategy: try to amend existing orders, only cancel+replace if needed
+        existing_bid = None
+        existing_ask = None
+        for oid, info in list(self._orders.items()):
+            if info.get("instId") == inst_id:
+                if info["side"] == "buy":
+                    existing_bid = oid
+                elif info["side"] == "sell":
+                    existing_ask = oid
 
-        # Batch place bid+ask simultaneously for lower latency
+        if existing_bid and existing_ask:
+            # Amend both in single batch call (1 API call vs 3 for cancel+place)
+            amends = [
+                {"instId": inst_id, "ordId": existing_bid, "newPx": bid_px, "newSz": qty_str},
+                {"instId": inst_id, "ordId": existing_ask, "newPx": ask_px, "newSz": qty_str},
+            ]
+            result = batch_amend(amends)
+            placed = 0
+            if result.get("code") == "0":
+                for i, r in enumerate(result.get("data", [])):
+                    if r.get("sCode") == "0":
+                        placed += 1
+                        # Update tracked prices
+                        oid = existing_bid if i == 0 else existing_ask
+                        self._orders[oid]["px"] = our_bid if i == 0 else our_ask
+                        self._orders[oid]["sz"] = qty
+            if placed == 2:
+                self._last_quote_mid[inst_id] = mid
+                self._last_quote_time[inst_id] = time.time()
+                log(f"[OKX-MM] {inst_id} AMEND bid={bid_px} ask={ask_px} edge={effective_edge:.1f}bps")
+                return True
+            # Amend failed — fall through to cancel+replace
+
+        # Cancel existing + batch place new (fallback)
+        cancel_all(inst_id)
+        self._orders = {k: v for k, v in self._orders.items() if v.get("instId") != inst_id}
+
         orders = [
             {"instId": inst_id, "tdMode": "cash", "side": "buy", "ordType": "post_only", "sz": qty_str, "px": bid_px},
             {"instId": inst_id, "tdMode": "cash", "side": "sell", "ordType": "post_only", "sz": qty_str, "px": ask_px},

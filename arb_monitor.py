@@ -289,6 +289,13 @@ def _get_metrics() -> dict:
             }
     except (ImportError, Exception):
         pass
+    # Signal attribution report
+    try:
+        from signal_attrib import attrib
+        metrics["_attribution"] = attrib.get_report()
+        metrics["_disabled_signals"] = list(attrib.disabled_signals)
+    except (ImportError, Exception):
+        pass
     return metrics
 
 
