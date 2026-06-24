@@ -46,15 +46,25 @@ def _symbol_to_okx(sym: str) -> str:
     return sym.replace("USDT", "") + "-USDT"
 
 
-def _execute_on_okx(inst_id: str, side: str, mid: float) -> bool:
-    """Place market order on OKX."""
+LIMIT_THRESHOLD_BPS = float(os.getenv("CROSS_ARB_LIMIT_BPS", "12"))  # use limit below this
+
+
+def _execute_on_okx(inst_id: str, side: str, mid: float, div_bps: float) -> bool:
+    """Execute on OKX. Limit order for small div, market for large."""
     if not os.getenv("OKX_API_KEY"):
         return False
     try:
         from okx_client import place_order
         qty = SIZE_USD / mid
         qty_str = f"{qty:.4f}" if mid > 100 else f"{qty:.2f}" if mid > 1 else f"{qty:.0f}"
-        r = place_order(inst_id, side, qty_str, order_type="market", td_mode="cash")
+
+        if abs(div_bps) >= LIMIT_THRESHOLD_BPS:
+            # Large divergence — market order for speed
+            r = place_order(inst_id, side, qty_str, order_type="market", td_mode="cash")
+        else:
+            # Small divergence — limit at mid for better fill
+            px = f"{mid:.2f}" if mid > 100 else f"{mid:.4f}" if mid > 1 else f"{mid:.6f}"
+            r = place_order(inst_id, side, qty_str, px=px, order_type="post_only", td_mode="cash")
         return r.get("code") == "0"
     except Exception as e:
         log(f"[CROSS-ARB] Exec error: {e}")
@@ -79,7 +89,7 @@ def _check_divergence(symbol: str):
         return
 
     side = "buy" if div_bps > 0 else "sell"
-    ok = _execute_on_okx(okx_inst, side, o_mid)
+    ok = _execute_on_okx(okx_inst, side, o_mid, div_bps)
 
     est_profit = SIZE_USD * abs(div_bps) / 10000 * 0.5
     _pnl += est_profit

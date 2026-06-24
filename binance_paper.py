@@ -45,14 +45,18 @@ class OFITracker:
     _alpha_1s: float = 1 - 0.93
     _alpha_5s: float = 1 - 0.986
     _alpha_30s: float = 1 - 0.998
-    # Adaptive weights — start at 0.5/0.3/0.2, adjust based on win rates
+    # Adaptive weights
     w1: float = 0.5
     w5: float = 0.3
     w30: float = 0.2
-    # Win/loss counters per dominant timeframe
-    _wins: list = field(default_factory=lambda: [0, 0, 0])  # 1s, 5s, 30s
+    _wins: list = field(default_factory=lambda: [0, 0, 0])
     _losses: list = field(default_factory=lambda: [0, 0, 0])
     _rebalance_count: int = 0
+    # Trade flow toxicity (VPIN-lite)
+    _buy_vol: float = 0.0
+    _sell_vol: float = 0.0
+    _flow_alpha: float = 1 - 0.99  # ~100 trade half-life
+    toxicity: float = 0.0  # [-1, +1]: +1 = all buys, -1 = all sells
 
     def update(self, bid_vol: float, ask_vol: float) -> float:
         """Update with new depth snapshot. Returns weighted composite OFI."""
@@ -63,31 +67,35 @@ class OFITracker:
         self.ofi_30s += self._alpha_30s * (raw_ofi - self.ofi_30s)
         return self.w1 * self.ofi_1s + self.w5 * self.ofi_5s + self.w30 * self.ofi_30s
 
+    def update_trade(self, qty_usd: float, is_buyer_maker: bool):
+        """Update trade flow from aggTrade stream."""
+        if is_buyer_maker:
+            self._sell_vol += self._flow_alpha * (qty_usd - self._sell_vol)
+        else:
+            self._buy_vol += self._flow_alpha * (qty_usd - self._buy_vol)
+        total = self._buy_vol + self._sell_vol
+        self.toxicity = (self._buy_vol - self._sell_vol) / total if total > 0 else 0
+
     def dominant_tf(self) -> int:
-        """Which timeframe had the strongest signal at this moment? 0=1s, 1=5s, 2=30s."""
         vals = [abs(self.ofi_1s), abs(self.ofi_5s), abs(self.ofi_30s)]
         return vals.index(max(vals))
 
     def record_outcome(self, win: bool):
-        """Record trade outcome for dominant timeframe at entry."""
         tf = self.dominant_tf()
         if win:
             self._wins[tf] += 1
         else:
             self._losses[tf] += 1
         self._rebalance_count += 1
-        # Rebalance every 50 trades
         if self._rebalance_count >= 50:
             self._rebalance()
 
     def _rebalance(self):
-        """Shift weights toward timeframes with higher win rates."""
         self._rebalance_count = 0
         rates = []
         for i in range(3):
             total = self._wins[i] + self._losses[i]
             rates.append(self._wins[i] / total if total >= 5 else 0.5)
-        # Softmax-style reweight
         s = sum(rates)
         if s > 0:
             self.w1 = rates[0] / s
@@ -340,17 +348,32 @@ async def run_pair(symbol: str):
                 buy_thresh = ofi_threshold + inv_skew
                 sell_thresh = -ofi_threshold + inv_skew
 
+                # Spread regime detection: tight (<5bp) → stricter, wide (>15bp) → relax
+                if ps.last_spread_bps < 5:
+                    buy_thresh *= 1.3   # tight spread = less opportunity, require stronger signal
+                    sell_thresh *= 1.3
+                elif ps.last_spread_bps > 15:
+                    buy_thresh *= 0.7   # wide spread = more edge per trade, relax
+                    sell_thresh *= 0.7
+
                 # Mean-reversion signal: lower threshold when price extended from VWAP
                 mr_signal = 0
                 spread = best_ask - best_bid
                 if ps.vwap > 0 and spread > 0:
-                    dev = (mid - ps.vwap) / spread  # deviation in spread units
-                    if dev < -1.5:  # price below VWAP — bullish reversion
+                    dev = (mid - ps.vwap) / spread
+                    if dev < -1.5:
                         mr_signal = 1
-                        buy_thresh *= 0.6  # easier to enter long
-                    elif dev > 1.5:  # price above VWAP — bearish reversion
+                        buy_thresh *= 0.6
+                    elif dev > 1.5:
                         mr_signal = -1
-                        sell_thresh *= 0.6  # easier to enter short
+                        sell_thresh *= 0.6
+
+                # Trade flow toxicity: confirm with aggressive order flow
+                tox = ps.ofi_tracker.toxicity
+                if tox > 0.3:  # buyers aggressive — easier to go long
+                    buy_thresh *= 0.8
+                elif tox < -0.3:  # sellers aggressive — easier to go short
+                    sell_thresh *= 0.8
 
                 if ps.position == 0:
                     if ps.last_ofi > buy_thresh and ps._momentum >= 3:
@@ -427,11 +450,32 @@ async def run_pair(symbol: str):
             await asyncio.sleep(2)
 
 
+async def _aggtrade_stream():
+    """Stream aggTrades for all symbols to track trade flow toxicity."""
+    streams = "/".join(f"{s.lower()}@aggTrade" for s in SYMBOLS)
+    url = f"wss://data-stream.binance.vision/stream?streams={streams}"
+    async for ws in websockets.connect(url, ssl=True):
+        try:
+            async for raw in ws:
+                msg = json.loads(raw)
+                data = msg.get("data", {})
+                symbol = data.get("s", "")
+                ps = pair_states.get(symbol)
+                if not ps:
+                    continue
+                px = float(data.get("p", 0))
+                qty = float(data.get("q", 0))
+                is_buyer_maker = data.get("m", False)
+                ps.ofi_tracker.update_trade(px * qty, is_buyer_maker)
+        except websockets.ConnectionClosed:
+            await asyncio.sleep(2)
+
+
 async def run():
     _load_stats()
     log(f"Multi-pair MM starting: {SYMBOLS}")
     log(f"  Max pos/pair: ${MAX_POS_USD}, Daily loss limit: -${DAILY_LOSS_LIMIT}, Capital: ${CAPITAL}")
-    await asyncio.gather(*[run_pair(s) for s in SYMBOLS], daily_reset_loop())
+    await asyncio.gather(*[run_pair(s) for s in SYMBOLS], _aggtrade_stream(), daily_reset_loop())
 
 
 if __name__ == "__main__":
