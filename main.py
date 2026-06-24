@@ -3,6 +3,7 @@ Includes health monitoring and automatic task restart on failure.
 """
 import asyncio
 import os
+import signal
 import threading
 import time
 
@@ -48,7 +49,17 @@ async def main():
     tg_send(f"🚀 Bot starting: {symbols}")
     threading.Thread(target=start_web, daemon=True).start()
     log(f"Dashboard at http://0.0.0.0:{os.getenv('PORT', '8080')}")
-    await asyncio.gather(
+
+    # Graceful shutdown on SIGINT/SIGTERM
+    loop = asyncio.get_event_loop()
+    stop = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass  # Windows
+
+    tasks = asyncio.gather(
         supervised("Polymarket", polymarket_monitor),
         supervised("Binance-MM", binance_mm_run),
         supervised("OKX-MM", okx_mm_run),
@@ -57,6 +68,18 @@ async def main():
         health_monitor(),
         daily_summary_loop(),
     )
+
+    # Wait for stop signal or tasks to complete
+    done = asyncio.ensure_future(tasks)
+    await asyncio.wait([done, asyncio.ensure_future(stop.wait())], return_when=asyncio.FIRST_COMPLETED)
+    if stop.is_set():
+        log("🛑 Shutdown signal received — stopping gracefully")
+        tg_send("🛑 Bot stopping (signal)")
+        done.cancel()
+        try:
+            await done
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

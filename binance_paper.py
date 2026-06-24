@@ -83,6 +83,8 @@ class OFITracker:
     # Institutional flow detection (iceberg/order splitting)
     _recent_trades: deque = field(default_factory=lambda: deque(maxlen=50))
     institutional_flow: float = 0.0  # 0-1 score, >0.5 = likely institutional
+    # Depth pressure gradient
+    depth_pressure: float = 0.0  # >0 = bid wall (support), <0 = ask wall (resistance)
 
     def update(self, bid_vol: float, ask_vol: float) -> float:
         """Update with new depth snapshot. Returns weighted composite OFI."""
@@ -92,6 +94,23 @@ class OFITracker:
         self.ofi_5s += self._alpha_5s * (raw_ofi - self.ofi_5s)
         self.ofi_30s += self._alpha_30s * (raw_ofi - self.ofi_30s)
         return self.w1 * self.ofi_1s + self.w5 * self.ofi_5s + self.w30 * self.ofi_30s
+
+    def update_depth_gradient(self, bids: list, asks: list):
+        """Compute depth pressure gradient from full orderbook.
+        Compares shallow (levels 1-5) vs deep (6-20) liquidity imbalance.
+        Positive = bid wall support, Negative = ask wall resistance."""
+        if len(bids) < 10 or len(asks) < 10:
+            return
+        # Shallow: levels 0-4, Deep: levels 5-19
+        shallow_bid = sum(float(b[1]) * float(b[0]) for b in bids[:5])
+        deep_bid = sum(float(b[1]) * float(b[0]) for b in bids[5:])
+        shallow_ask = sum(float(a[1]) * float(a[0]) for a in asks[:5])
+        deep_ask = sum(float(a[1]) * float(a[0]) for a in asks[5:])
+        # Gradient: deep support vs deep resistance
+        total_deep = deep_bid + deep_ask
+        if total_deep > 0:
+            raw = (deep_bid - deep_ask) / total_deep
+            self.depth_pressure += 0.1 * (raw - self.depth_pressure)  # smooth
 
     def update_trade(self, qty_usd: float, is_buyer_maker: bool, ts_ms: float = 0):
         """Update trade flow from aggTrade stream + detect institutional splitting."""
@@ -181,6 +200,7 @@ class PairState:
     _prev_mid: float = 0.0
     # Trailing stop
     _best_pnl: float = 0.0  # best unrealized PnL since entry
+    _scaled_out: bool = False  # True after first partial take-profit
     # Regime detection
     regime: RegimeDetector = field(default_factory=RegimeDetector)
 
@@ -369,6 +389,7 @@ async def run_pair(symbol: str):
                 bid_vol = sum(float(b[1]) * float(b[0]) * (0.85 ** i) for i, b in enumerate(bids))
                 ask_vol = sum(float(a[1]) * float(a[0]) * (0.85 ** i) for i, a in enumerate(asks))
                 ps.last_ofi = ps.ofi_tracker.update(bid_vol, ask_vol)
+                ps.ofi_tracker.update_depth_gradient(bids, asks)
 
                 # Update VWAP anchor for mean-reversion
                 tick_vol = bid_vol + ask_vol
@@ -465,6 +486,13 @@ async def run_pair(symbol: str):
                 if ps.last_spread_bps < 1.0:
                     continue  # sub-1bp spread = no edge, skip tick
 
+                # Depth pressure gradient: bid wall = easier long, ask wall = easier short
+                dp = ps.ofi_tracker.depth_pressure
+                if dp > 0.2:   # strong bid wall support
+                    buy_thresh *= 0.8
+                elif dp < -0.2:  # strong ask wall resistance
+                    sell_thresh *= 0.8
+
                 if ps.position == 0:
                     # Momentum confirmation: price ticks + aggTrade direction must align
                     tox_confirms_buy = tox > -0.1  # not actively selling
@@ -494,13 +522,22 @@ async def run_pair(symbol: str):
                     trail_dist = atr * atr_mult if atr > 0 else spread * 2
                     drawdown_from_peak = ps._best_pnl - unrealized
 
-                    if ps._best_pnl > 0 and drawdown_from_peak > trail_dist / ps.entry_price * ps.position:
+                    # Partial profit-taking: close 50% at 1x ATR profit
+                    if not ps._scaled_out and atr > 0 and pnl_per_unit >= atr:
+                        half = ps.position * 0.5
+                        partial_profit = pnl_per_unit / ps.entry_price * half
+                        _record(ps, partial_profit)
+                        ps.position -= half
+                        ps._scaled_out = True
+                        log(f"[{symbol}] SCALE_LONG 50% +${partial_profit:.4f} (remain ${ps.position:.0f})")
+                    elif ps._best_pnl > 0 and drawdown_from_peak > trail_dist / ps.entry_price * ps.position:
                         # Trailing stop hit — lock in profit
                         profit = unrealized
                         _record(ps, profit)
                         log(f"[{symbol}] TRAIL_LONG +${profit:.4f} (peak ${ps._best_pnl:.4f} wr={ps.wr})")
                         ps.position = 0
                         ps._best_pnl = 0
+                        ps._scaled_out = False
                     elif pnl_per_unit <= -trail_dist:
                         # Hard stop at 1.5*ATR loss
                         profit = unrealized
@@ -508,6 +545,7 @@ async def run_pair(symbol: str):
                         log(f"[{symbol}] STOP_LONG ${profit:.4f} (total ${ps.pnl:.4f})")
                         ps.position = 0
                         ps._best_pnl = 0
+                        ps._scaled_out = False
                     elif ps.last_ofi < sell_thresh:
                         profit = unrealized
                         _record(ps, profit)
@@ -515,6 +553,7 @@ async def run_pair(symbol: str):
                         ps.position = -size
                         ps.entry_price = best_bid
                         ps._best_pnl = 0
+                        ps._scaled_out = False
 
                 elif ps.position < 0:
                     # ATR-based trailing stop + OFI flip (regime-adaptive)
@@ -526,18 +565,28 @@ async def run_pair(symbol: str):
                     trail_dist = atr * atr_mult if atr > 0 else spread * 2
                     drawdown_from_peak = ps._best_pnl - unrealized
 
-                    if ps._best_pnl > 0 and drawdown_from_peak > trail_dist / ps.entry_price * abs(ps.position):
+                    # Partial profit-taking: close 50% at 1x ATR profit
+                    if not ps._scaled_out and atr > 0 and pnl_per_unit >= atr:
+                        half = abs(ps.position) * 0.5
+                        partial_profit = pnl_per_unit / ps.entry_price * half
+                        _record(ps, partial_profit)
+                        ps.position += half  # reduce short
+                        ps._scaled_out = True
+                        log(f"[{symbol}] SCALE_SHORT 50% +${partial_profit:.4f} (remain ${ps.position:.0f})")
+                    elif ps._best_pnl > 0 and drawdown_from_peak > trail_dist / ps.entry_price * abs(ps.position):
                         profit = unrealized
                         _record(ps, profit)
                         log(f"[{symbol}] TRAIL_SHORT +${profit:.4f} (peak ${ps._best_pnl:.4f} wr={ps.wr})")
                         ps.position = 0
                         ps._best_pnl = 0
+                        ps._scaled_out = False
                     elif pnl_per_unit <= -trail_dist:
                         profit = unrealized
                         _record(ps, profit)
                         log(f"[{symbol}] STOP_SHORT ${profit:.4f} (total ${ps.pnl:.4f})")
                         ps.position = 0
                         ps._best_pnl = 0
+                        ps._scaled_out = False
                     elif ps.last_ofi > buy_thresh:
                         profit = unrealized
                         _record(ps, profit)
@@ -545,6 +594,7 @@ async def run_pair(symbol: str):
                         ps.position = size
                         ps.entry_price = best_ask
                         ps._best_pnl = 0
+                        ps._scaled_out = False
 
         except websockets.ConnectionClosed:
             log(f"[{symbol}] Reconnecting...")
