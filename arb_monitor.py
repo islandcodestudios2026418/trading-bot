@@ -95,6 +95,8 @@ def _get_stats() -> dict:
             "variance_ratio": round(ps.regime.vr, 2),
             "institutional_flow": round(ps.ofi_tracker.institutional_flow, 2),
             "toxicity": round(ps.ofi_tracker.toxicity, 2),
+            "depth_pressure": round(ps.ofi_tracker.depth_pressure, 3),
+            "spoof_score": round(ps.ofi_tracker.spoof_score, 2),
         }
 
     # Funding arb positions
@@ -236,12 +238,27 @@ def _get_analytics() -> dict:
     except (ImportError, Exception):
         pass
 
+    # Execution quality
+    exec_quality = {}
+    try:
+        from binance_paper import _exec_quality
+        for sym, eq in _exec_quality.items():
+            avg_slip = eq["slippage_sum"] / eq["fill_count"] if eq["fill_count"] > 0 else 0
+            exec_quality[sym] = {
+                "avg_slippage_bps": round(avg_slip, 2),
+                "fills": eq["fill_count"],
+                "adverse_selections": eq["adverse_count"],
+            }
+    except (ImportError, Exception):
+        pass
+
     return {
         "sharpe": round(sharpe, 2),
         "max_drawdown_pct": round(max_dd * 100, 2),
         "total_returns": len(returns),
         "equity_current": equities[-1] if equities else STARTING_CAPITAL,
         "regime": regime_stats,
+        "execution_quality": exec_quality,
         "uptime_h": round((time.time() - _start_time) / 3600, 1),
     }
 

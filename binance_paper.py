@@ -35,6 +35,34 @@ CONSEC_LOSS_PAUSE = 5
 PAUSE_SECONDS = 300
 STATS_FILE = os.getenv("STATS_FILE", "stats.json")
 
+# Fee model (realistic simulation)
+# OKX maker: -0.01% (rebate), taker: 0.05%
+# Our entries are at best_ask/bid (taker), exits can be maker or taker
+ENTRY_FEE_BPS = float(os.getenv("ENTRY_FEE_BPS", "5"))    # 0.05% taker entry
+EXIT_FEE_BPS = float(os.getenv("EXIT_FEE_BPS", "1"))      # 0.01% maker exit (we post limit)
+# Execution quality tracking
+_exec_quality: dict[str, dict] = {}  # symbol → {slippage_sum, fill_count, adverse_count}
+
+
+def _track_exec(symbol: str, entry_px: float, mid: float, side: str):
+    """Track execution quality — slippage from mid at time of entry."""
+    if symbol not in _exec_quality:
+        _exec_quality[symbol] = {"slippage_sum": 0.0, "fill_count": 0, "adverse_count": 0}
+    eq = _exec_quality[symbol]
+    # Slippage: how far from mid we entered (always negative for us)
+    if side == "buy":
+        slippage_bps = (entry_px - mid) / mid * 10000  # positive = bad (paid above mid)
+    else:
+        slippage_bps = (mid - entry_px) / mid * 10000  # positive = bad (sold below mid)
+    eq["slippage_sum"] += slippage_bps
+    eq["fill_count"] += 1
+
+
+def _track_adverse(symbol: str):
+    """Record adverse selection event."""
+    if symbol in _exec_quality:
+        _exec_quality[symbol]["adverse_count"] += 1
+
 
 def _get_session() -> str:
     """Detect trading session based on UTC hour."""
@@ -226,6 +254,9 @@ class PairState:
     # Momentum: consecutive price direction counter
     _momentum: int = 0  # +N = N consecutive up ticks, -N = down
     _prev_mid: float = 0.0
+    # Anti-adverse-selection: OFI direction stability counter
+    _ofi_stable_ticks: int = 0  # how many ticks OFI has been same sign
+    _last_ofi_sign: int = 0  # +1, -1, 0
     # Trailing stop
     _best_pnl: float = 0.0  # best unrealized PnL since entry
     _scaled_out: bool = False  # True after first partial take-profit
@@ -343,20 +374,26 @@ def _calc_atr(prices: deque) -> float:
 
 def _record(ps: PairState, profit: float):
     global daily_pnl, daily_fills, daily_wins
-    ps.pnl += profit
+    # Apply realistic fees: entry (taker) + exit (maker)
+    trade_value = abs(ps.position) if ps.position != 0 else 10  # fallback
+    entry_fee = trade_value * ENTRY_FEE_BPS / 10000
+    exit_fee = trade_value * EXIT_FEE_BPS / 10000
+    net_profit = profit - entry_fee - exit_fee
+
+    ps.pnl += net_profit
     ps.fills += 1
-    daily_pnl += profit
+    daily_pnl += net_profit
     daily_fills += 1
     # Kelly sizing: track win/loss amounts
-    if profit > 0:
-        ps._recent_wins.append(profit)
+    if net_profit > 0:
+        ps._recent_wins.append(net_profit)
     else:
-        ps._recent_losses.append(profit)
+        ps._recent_losses.append(net_profit)
     # Adaptive OFI weight learning
-    ps.ofi_tracker.record_outcome(profit > 0)
+    ps.ofi_tracker.record_outcome(net_profit > 0)
     # Regime analytics
-    ps.regime.record_fill(profit)
-    if profit > 0:
+    ps.regime.record_fill(net_profit)
+    if net_profit > 0:
         ps.wins += 1
         daily_wins += 1
         ps.consec_losses = 0
@@ -365,8 +402,8 @@ def _record(ps: PairState, profit: float):
         if ps.consec_losses >= CONSEC_LOSS_PAUSE:
             ps.paused_until = time.time() + PAUSE_SECONDS
             log(f"{ps.symbol} paused {PAUSE_SECONDS}s after {CONSEC_LOSS_PAUSE} consecutive losses")
-            alert_trade(ps.symbol, "PAUSED", profit, daily_pnl)
-    record_trade(profit)
+            alert_trade(ps.symbol, "PAUSED", net_profit, daily_pnl)
+    record_trade(net_profit)
     # Alert every 10th fill or on significant loss
     if daily_fills % 10 == 0 or profit < -0.01:
         alert_trade(ps.symbol, "FILL", profit, daily_pnl)
@@ -419,6 +456,14 @@ async def run_pair(symbol: str):
                 ask_vol = sum(float(a[1]) * float(a[0]) * (0.85 ** i) for i, a in enumerate(asks))
                 ps.last_ofi = ps.ofi_tracker.update(bid_vol, ask_vol)
                 ps.ofi_tracker.update_depth_gradient(bids, asks)
+
+                # Track OFI direction stability for anti-adverse-selection
+                curr_sign = 1 if ps.last_ofi > 0.1 else (-1 if ps.last_ofi < -0.1 else 0)
+                if curr_sign == ps._last_ofi_sign and curr_sign != 0:
+                    ps._ofi_stable_ticks += 1
+                else:
+                    ps._ofi_stable_ticks = 0
+                ps._last_ofi_sign = curr_sign
 
                 # Update VWAP anchor for mean-reversion
                 tick_vol = bid_vol + ask_vol
@@ -532,20 +577,24 @@ async def run_pair(symbol: str):
                     tox_confirms_buy = tox > -0.1  # not actively selling
                     tox_confirms_sell = tox < 0.1  # not actively buying
                     mom_req = sp["mom_req"]  # session-adaptive momentum requirement
-                    if ps.last_ofi > buy_thresh and ps._momentum >= mom_req and tox_confirms_buy:
+                    # Anti-adverse-selection: require OFI stable for 2+ ticks (~200ms)
+                    signal_stable = ps._ofi_stable_ticks >= 2
+                    if ps.last_ofi > buy_thresh and ps._momentum >= mom_req and tox_confirms_buy and signal_stable:
                         # Scale size by spread width (wider spread = more edge = bigger size)
                         spread_mult = min(2.0, max(0.5, ps.last_spread_bps / 5.0))
                         adj_size = size * spread_mult * sp["size_mult"]
                         ps.position = adj_size
                         ps.entry_price = best_ask
                         ps._entry_time = time.time()
+                        _track_exec(symbol, best_ask, mid, "buy")
                         log(f"[{symbol}] BUY ${adj_size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
-                    elif ps.last_ofi < sell_thresh and ps._momentum <= -mom_req and tox_confirms_sell:
+                    elif ps.last_ofi < sell_thresh and ps._momentum <= -mom_req and tox_confirms_sell and signal_stable:
                         spread_mult = min(2.0, max(0.5, ps.last_spread_bps / 5.0))
                         adj_size = size * spread_mult * sp["size_mult"]
                         ps.position = -adj_size
                         ps.entry_price = best_bid
                         ps._entry_time = time.time()
+                        _track_exec(symbol, best_bid, mid, "sell")
                         log(f"[{symbol}] SELL ${adj_size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
 
                 elif ps.position > 0:
