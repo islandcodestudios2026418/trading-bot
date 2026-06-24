@@ -108,6 +108,12 @@ class OFITracker:
     _sell_vol: float = 0.0
     _flow_alpha: float = 1 - 0.99  # ~100 trade half-life
     toxicity: float = 0.0  # [-1, +1]: +1 = all buys, -1 = all sells
+    # VPIN: volume-synchronized probability of informed trading
+    _vpin_bucket_size: float = 1000.0  # USD per bucket
+    _vpin_bucket_buy: float = 0.0
+    _vpin_bucket_sell: float = 0.0
+    _vpin_buckets: deque = field(default_factory=lambda: deque(maxlen=50))  # last 50 bucket imbalances
+    vpin: float = 0.0  # 0-1: high = toxic flow (informed traders dominating)
     # Institutional flow detection (iceberg/order splitting)
     _recent_trades: deque = field(default_factory=lambda: deque(maxlen=50))
     institutional_flow: float = 0.0  # 0-1 score, >0.5 = likely institutional
@@ -115,6 +121,8 @@ class OFITracker:
     _vol_ema: float = 0.0  # 30s EMA of volume per tick
     _vol_alpha: float = 1 - 0.97  # ~30 tick half-life at 1 trade/sec
     volume_surge: float = 1.0  # current_vol / ema_vol, >3.0 = surge
+    # Order book imbalance (OBI): shallow levels 1-5
+    obi: float = 0.0  # [-1,+1]: +1 = all bids, useful as alpha confirmation
     # Depth pressure gradient
     depth_pressure: float = 0.0  # >0 = bid wall (support), <0 = ask wall (resistance)
     # Quote stuffing/spoofing detection
@@ -134,15 +142,16 @@ class OFITracker:
         return self.w1 * self.ofi_1s + self.w5 * self.ofi_5s + self.w30 * self.ofi_30s
 
     def update_depth_gradient(self, bids: list, asks: list):
-        """Compute depth pressure gradient from full orderbook.
-        Compares shallow (levels 1-5) vs deep (6-20) liquidity imbalance.
-        Positive = bid wall support, Negative = ask wall resistance."""
+        """Compute depth pressure gradient + OBI from full orderbook."""
         if len(bids) < 10 or len(asks) < 10:
             return
-        # Shallow: levels 0-4, Deep: levels 5-19
+        # OBI: shallow levels 1-5 volume imbalance
         shallow_bid = sum(float(b[1]) * float(b[0]) for b in bids[:5])
-        deep_bid = sum(float(b[1]) * float(b[0]) for b in bids[5:])
         shallow_ask = sum(float(a[1]) * float(a[0]) for a in asks[:5])
+        raw_obi = (shallow_bid - shallow_ask) / (shallow_bid + shallow_ask) if (shallow_bid + shallow_ask) > 0 else 0
+        self.obi += 0.1 * (raw_obi - self.obi)  # smooth
+        # Shallow: levels 0-4, Deep: levels 5-19
+        deep_bid = sum(float(b[1]) * float(b[0]) for b in bids[5:])
         deep_ask = sum(float(a[1]) * float(a[0]) for a in asks[5:])
         # Gradient: deep support vs deep resistance
         total_deep = deep_bid + deep_ask
@@ -173,7 +182,7 @@ class OFITracker:
             self.spoof_score *= 0.9  # decay
 
     def update_trade(self, qty_usd: float, is_buyer_maker: bool, ts_ms: float = 0):
-        """Update trade flow from aggTrade stream + detect institutional splitting."""
+        """Update trade flow from aggTrade stream + detect institutional splitting + VPIN."""
         # Volume surge detection: compare current vol to EMA
         if self._vol_ema > 0:
             self.volume_surge = qty_usd / self._vol_ema
@@ -181,10 +190,22 @@ class OFITracker:
 
         if is_buyer_maker:
             self._sell_vol += self._flow_alpha * (qty_usd - self._sell_vol)
+            self._vpin_bucket_sell += qty_usd
         else:
             self._buy_vol += self._flow_alpha * (qty_usd - self._buy_vol)
+            self._vpin_bucket_buy += qty_usd
         total = self._buy_vol + self._sell_vol
         self.toxicity = (self._buy_vol - self._sell_vol) / total if total > 0 else 0
+
+        # VPIN: when bucket fills, compute imbalance and roll
+        bucket_total = self._vpin_bucket_buy + self._vpin_bucket_sell
+        if bucket_total >= self._vpin_bucket_size:
+            imbalance = abs(self._vpin_bucket_buy - self._vpin_bucket_sell) / bucket_total
+            self._vpin_buckets.append(imbalance)
+            self._vpin_bucket_buy = 0.0
+            self._vpin_bucket_sell = 0.0
+            if self._vpin_buckets:
+                self.vpin = sum(self._vpin_buckets) / len(self._vpin_buckets)
 
         # Institutional detection: many similar-sized trades in short window
         import time
@@ -266,10 +287,12 @@ class PairState:
     # Anti-adverse-selection: OFI direction stability counter
     _ofi_stable_ticks: int = 0  # how many ticks OFI has been same sign
     _last_ofi_sign: int = 0  # +1, -1, 0
-    # Trailing stop
+    # Trailing stop — chandelier exit
     _best_pnl: float = 0.0  # best unrealized PnL since entry
     _scaled_out: bool = False  # True after first partial take-profit
     _entry_time: float = 0.0  # time.time() of position entry
+    _highest_mid: float = 0.0  # highest mid since entry (chandelier long)
+    _lowest_mid: float = 999999.0  # lowest mid since entry (chandelier short)
     # Regime detection
     regime: RegimeDetector = field(default_factory=RegimeDetector)
 
@@ -569,6 +592,15 @@ async def run_pair(symbol: str):
                     elif tox < 0:
                         sell_thresh *= 0.5  # institutional selling → much easier short entry
 
+                # VPIN (trade flow toxicity): high = informed traders active, widen quotes
+                vpin = ps.ofi_tracker.vpin
+                if vpin > 0.7:  # very toxic — step back
+                    buy_thresh *= 1.5
+                    sell_thresh *= 1.5
+                elif vpin > 0.5:  # moderately toxic — cautious
+                    buy_thresh *= 1.2
+                    sell_thresh *= 1.2
+
                 # Spread-adaptive: no edge if spread is too tight
                 if ps.last_spread_bps < 1.0:
                     continue  # sub-1bp spread = no edge, skip tick
@@ -579,6 +611,13 @@ async def run_pair(symbol: str):
                     buy_thresh *= 0.8
                 elif dp < -0.2:  # strong ask wall resistance
                     sell_thresh *= 0.8
+
+                # OBI (order book imbalance): shallow bid/ask volume ratio confirmation
+                obi = ps.ofi_tracker.obi
+                if obi > 0.15:      # bids dominating → easier long
+                    buy_thresh *= 0.85
+                elif obi < -0.15:   # asks dominating → easier short
+                    sell_thresh *= 0.85
 
                 # Spoofing detection: if detected, increase threshold (less reliable book)
                 if ps.ofi_tracker.spoof_score > 0.5:
@@ -606,6 +645,8 @@ async def run_pair(symbol: str):
                         ps.position = adj_size
                         ps.entry_price = best_ask
                         ps._entry_time = time.time()
+                        ps._highest_mid = mid
+                        ps._lowest_mid = 999999
                         _track_exec(symbol, best_ask, mid, "buy")
                         log(f"[{symbol}] BUY ${adj_size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
                     elif ps.last_ofi < sell_thresh and ps._momentum <= -mom_req and tox_confirms_sell and signal_stable:
@@ -614,6 +655,8 @@ async def run_pair(symbol: str):
                         ps.position = -adj_size
                         ps.entry_price = best_bid
                         ps._entry_time = time.time()
+                        ps._highest_mid = 0
+                        ps._lowest_mid = mid
                         _track_exec(symbol, best_bid, mid, "sell")
                         log(f"[{symbol}] SELL ${adj_size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
 
@@ -630,12 +673,11 @@ async def run_pair(symbol: str):
                         ps._scaled_out = False
                         ps._entry_time = 0
                         continue
-                    # ATR-based trailing stop + OFI flip (regime-adaptive)
-                    spread = best_ask - best_bid
+                    # Chandelier exit: trail from highest high - N*ATR
+                    ps._highest_mid = max(ps._highest_mid, mid)
                     ps._best_pnl = max(ps._best_pnl, unrealized)
                     atr_mult = ps.regime.adapt_exit(1.5)
-                    trail_dist = atr * atr_mult if atr > 0 else spread * 2
-                    drawdown_from_peak = ps._best_pnl - unrealized
+                    chandelier_stop = ps._highest_mid - atr * atr_mult if atr > 0 else ps.entry_price - (best_ask - best_bid) * 2
 
                     # Partial profit-taking: close 50% at 1x ATR profit
                     if not ps._scaled_out and atr > 0 and pnl_per_unit >= atr:
@@ -645,22 +687,16 @@ async def run_pair(symbol: str):
                         ps.position -= half
                         ps._scaled_out = True
                         log(f"[{symbol}] SCALE_LONG 50% +${partial_profit:.4f} (remain ${ps.position:.0f})")
-                    elif ps._best_pnl > 0 and drawdown_from_peak > trail_dist / ps.entry_price * ps.position:
-                        # Trailing stop hit — lock in profit
+                    elif mid <= chandelier_stop:
+                        # Chandelier trailing stop hit
                         profit = unrealized
                         _record(ps, profit)
-                        log(f"[{symbol}] TRAIL_LONG +${profit:.4f} (peak ${ps._best_pnl:.4f} wr={ps.wr})")
+                        log(f"[{symbol}] CHAND_LONG ${profit:.4f} (high={ps._highest_mid:.2f} stop={chandelier_stop:.2f} wr={ps.wr})")
                         ps.position = 0
                         ps._best_pnl = 0
                         ps._scaled_out = False
-                    elif pnl_per_unit <= -trail_dist:
-                        # Hard stop at 1.5*ATR loss
-                        profit = unrealized
-                        _record(ps, profit)
-                        log(f"[{symbol}] STOP_LONG ${profit:.4f} (total ${ps.pnl:.4f})")
-                        ps.position = 0
-                        ps._best_pnl = 0
-                        ps._scaled_out = False
+                        ps._highest_mid = 0
+                        ps._lowest_mid = 999999
                     elif ps.last_ofi < sell_thresh:
                         profit = unrealized
                         _record(ps, profit)
@@ -669,6 +705,8 @@ async def run_pair(symbol: str):
                         ps.entry_price = best_bid
                         ps._best_pnl = 0
                         ps._scaled_out = False
+                        ps._highest_mid = 0
+                        ps._lowest_mid = mid
 
                 elif ps.position < 0:
                     # Position aging: force exit after 60s if not profitable
@@ -683,12 +721,11 @@ async def run_pair(symbol: str):
                         ps._scaled_out = False
                         ps._entry_time = 0
                         continue
-                    # ATR-based trailing stop + OFI flip (regime-adaptive)
-                    spread = best_ask - best_bid
+                    # Chandelier exit: trail from lowest low + N*ATR
+                    ps._lowest_mid = min(ps._lowest_mid, mid)
                     ps._best_pnl = max(ps._best_pnl, unrealized)
                     atr_mult = ps.regime.adapt_exit(1.5)
-                    trail_dist = atr * atr_mult if atr > 0 else spread * 2
-                    drawdown_from_peak = ps._best_pnl - unrealized
+                    chandelier_stop = ps._lowest_mid + atr * atr_mult if atr > 0 else ps.entry_price + (best_ask - best_bid) * 2
 
                     # Partial profit-taking: close 50% at 1x ATR profit
                     if not ps._scaled_out and atr > 0 and pnl_per_unit >= atr:
@@ -698,20 +735,16 @@ async def run_pair(symbol: str):
                         ps.position += half  # reduce short
                         ps._scaled_out = True
                         log(f"[{symbol}] SCALE_SHORT 50% +${partial_profit:.4f} (remain ${ps.position:.0f})")
-                    elif ps._best_pnl > 0 and drawdown_from_peak > trail_dist / ps.entry_price * abs(ps.position):
+                    elif mid >= chandelier_stop:
+                        # Chandelier trailing stop hit
                         profit = unrealized
                         _record(ps, profit)
-                        log(f"[{symbol}] TRAIL_SHORT +${profit:.4f} (peak ${ps._best_pnl:.4f} wr={ps.wr})")
+                        log(f"[{symbol}] CHAND_SHORT ${profit:.4f} (low={ps._lowest_mid:.2f} stop={chandelier_stop:.2f} wr={ps.wr})")
                         ps.position = 0
                         ps._best_pnl = 0
                         ps._scaled_out = False
-                    elif pnl_per_unit <= -trail_dist:
-                        profit = unrealized
-                        _record(ps, profit)
-                        log(f"[{symbol}] STOP_SHORT ${profit:.4f} (total ${ps.pnl:.4f})")
-                        ps.position = 0
-                        ps._best_pnl = 0
-                        ps._scaled_out = False
+                        ps._highest_mid = 0
+                        ps._lowest_mid = 999999
                     elif ps.last_ofi > buy_thresh:
                         profit = unrealized
                         _record(ps, profit)
@@ -720,6 +753,8 @@ async def run_pair(symbol: str):
                         ps.entry_price = best_ask
                         ps._best_pnl = 0
                         ps._scaled_out = False
+                        ps._highest_mid = mid
+                        ps._lowest_mid = 999999
 
         except websockets.ConnectionClosed:
             log(f"[{symbol}] Reconnecting...")
