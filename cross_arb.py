@@ -37,6 +37,8 @@ _okx_mids: dict[str, float] = {}
 _last_trade: dict[str, float] = {}
 _pnl = 0.0
 _trades = 0
+_last_okx_call = 0.0
+_OKX_MIN_INTERVAL = 0.15  # 150ms between OKX REST calls (~6.6/s, well under 20/2s)
 
 
 def _symbol_to_okx(sym: str) -> str:
@@ -46,7 +48,12 @@ def _symbol_to_okx(sym: str) -> str:
 
 
 def _get_okx_mid(inst_id: str) -> float:
-    """Fetch OKX mid-price (REST, low-latency enough for 8bps+ divergence)."""
+    """Fetch OKX mid-price (REST, rate-limited)."""
+    global _last_okx_call
+    now = time.time()
+    if now - _last_okx_call < _OKX_MIN_INTERVAL:
+        return _okx_mids.get(inst_id.replace("-USDT", "") + "USDT", 0)  # return cached
+    _last_okx_call = now
     try:
         r = requests.get(f"{OKX_BASE}/api/v5/market/ticker",
                          params={"instId": inst_id}, timeout=3)

@@ -112,6 +112,9 @@ class PairState:
     # Mean-reversion: VWAP anchor
     vwap_num: float = 0.0
     vwap_den: float = 0.0
+    # Kelly sizing: track recent trade sizes
+    _recent_wins: deque = field(default_factory=lambda: deque(maxlen=50))
+    _recent_losses: deque = field(default_factory=lambda: deque(maxlen=50))
 
     @property
     def wr(self):
@@ -120,6 +123,24 @@ class PairState:
     @property
     def vwap(self):
         return self.vwap_num / self.vwap_den if self.vwap_den > 0 else 0
+
+    @property
+    def kelly_fraction(self) -> float:
+        """Half-Kelly fraction based on recent 50 trades. Returns 0.25-1.0 multiplier."""
+        if len(self._recent_wins) + len(self._recent_losses) < 20:
+            return 1.0  # not enough data, use full base size
+        total = len(self._recent_wins) + len(self._recent_losses)
+        p = len(self._recent_wins) / total
+        if not self._recent_wins or not self._recent_losses:
+            return 1.0
+        avg_w = sum(self._recent_wins) / len(self._recent_wins)
+        avg_l = sum(self._recent_losses) / len(self._recent_losses)
+        if avg_l == 0:
+            return 1.0
+        b = avg_w / abs(avg_l)
+        kelly = (p * b - (1 - p)) / b if b > 0 else 0
+        # Half-Kelly for safety, clamped to [0.25, 1.0]
+        return max(0.25, min(1.0, kelly * 0.5 + 0.5))
 
 
 # Global state shared with dashboard
@@ -176,6 +197,11 @@ def _record(ps: PairState, profit: float):
     ps.fills += 1
     daily_pnl += profit
     daily_fills += 1
+    # Kelly sizing: track win/loss amounts
+    if profit > 0:
+        ps._recent_wins.append(profit)
+    else:
+        ps._recent_losses.append(profit)
     # Adaptive OFI weight learning
     ps.ofi_tracker.record_outcome(profit > 0)
     if profit > 0:
@@ -195,11 +221,11 @@ def _record(ps: PairState, profit: float):
 
 
 async def run_pair(symbol: str):
-    """Run MM for one symbol using depth5 stream."""
+    """Run MM for one symbol using depth20 stream."""
     ps = PairState(symbol=symbol)
     pair_states[symbol] = ps
-    url = f"wss://data-stream.binance.vision/ws/{symbol.lower()}@depth5@100ms"
-    log(f"[{symbol}] Connecting depth stream...")
+    url = f"wss://data-stream.binance.vision/ws/{symbol.lower()}@depth20@100ms"
+    log(f"[{symbol}] Connecting depth20 stream...")
 
     async for ws in websockets.connect(url, ssl=True):
         try:
@@ -226,9 +252,10 @@ async def run_pair(symbol: str):
                 ps.mid_prices.append(mid)
                 ps.last_spread_bps = (best_ask - best_bid) / mid * 10000
 
-                # Multi-timeframe OFI (1s/5s/30s weighted)
-                bid_vol = sum(float(b[1]) * float(b[0]) for b in bids)
-                ask_vol = sum(float(a[1]) * float(a[0]) for a in asks)
+                # Multi-timeframe OFI (1s/5s/30s weighted) with depth-weighted volumes
+                # Closer levels get exponentially more weight (decay=0.85)
+                bid_vol = sum(float(b[1]) * float(b[0]) * (0.85 ** i) for i, b in enumerate(bids))
+                ask_vol = sum(float(a[1]) * float(a[0]) * (0.85 ** i) for i, a in enumerate(asks))
                 ps.last_ofi = ps.ofi_tracker.update(bid_vol, ask_vol)
 
                 # Update VWAP anchor for mean-reversion
@@ -248,14 +275,15 @@ async def run_pair(symbol: str):
                         if base_atr > 0 and atr > base_atr * 3:
                             continue  # skip — volatility spike
 
-                # Position sizing: inverse vol (high ATR = smaller size)
-                base_size = min(MAX_POS_USD * 0.2, CAPITAL * 0.01)  # 1% capital or 20% max_pos
+                # Position sizing: inverse vol × Kelly fraction
+                base_size = min(MAX_POS_USD * 0.2, CAPITAL * 0.01)
                 if atr > 0 and mid > 0:
-                    vol_ratio = (atr / mid) * 10000  # vol in bps
+                    vol_ratio = (atr / mid) * 10000
                     size = base_size / max(1, vol_ratio / 5)
                     size = max(5, min(size, MAX_POS_USD * 0.3))
                 else:
                     size = base_size
+                size *= ps.kelly_fraction  # Kelly adjustment
 
                 # OFI-biased entry with inventory skew (Avellaneda-Stoikov)
                 # + Mean-reversion overlay: fade extended moves from VWAP
