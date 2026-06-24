@@ -55,6 +55,18 @@ def record_trade(profit: float, source: str = "binance"):
     })
 
 
+def _get_session_info() -> dict:
+    """Get current trading session info."""
+    try:
+        from binance_paper import _get_session, _current_session, SESSION_PARAMS
+        session = _current_session
+        params = SESSION_PARAMS.get(session, {})
+        return {"name": session, "threshold_mult": params.get("threshold_mult", 1.0),
+                "size_mult": params.get("size_mult", 1.0), "mom_req": params.get("mom_req", 3)}
+    except (ImportError, Exception):
+        return {"name": "unknown"}
+
+
 def _get_stats() -> dict:
     """Build stats JSON from all subsystems."""
     try:
@@ -81,6 +93,8 @@ def _get_stats() -> dict:
             "paused": time.time() < ps.paused_until,
             "regime": ps.regime.regime,
             "variance_ratio": round(ps.regime.vr, 2),
+            "institutional_flow": round(ps.ofi_tracker.institutional_flow, 2),
+            "toxicity": round(ps.ofi_tracker.toxicity, 2),
         }
 
     # Funding arb positions
@@ -114,6 +128,7 @@ def _get_stats() -> dict:
         "daily_pnl": round(daily_pnl, 4),
         "daily_fills": daily_fills,
         "daily_win_rate": f"{daily_wins/daily_fills*100:.0f}%" if daily_fills else "-",
+        "session": _get_session_info(),
         "pairs": pairs,
         "funding_arb": funding_arb,
         "cross_arb": cross,
@@ -121,29 +136,38 @@ def _get_stats() -> dict:
     }
 
 
-DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Trading Bot v6.1</title>
+DASHBOARD_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><title>Trading Bot v7.2</title>
 <meta http-equiv="refresh" content="30">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;margin:20px}
 h2{color:#10b981}h3{color:#3b82f6;margin-top:20px}table{border-collapse:collapse;margin:10px 0}
 td,th{padding:4px 12px;border:1px solid #333;text-align:right}
 th{background:#2d2d44}.pos{color:#10b981}.neg{color:#ef4444}.dim{color:#888}
-canvas{max-width:900px;max-height:350px;margin:20px 0}</style></head><body>
-<h2>Trading Bot v6.1 — Multi-Strategy</h2>
+.trend{color:#f59e0b}.range{color:#8b5cf6}.neutral{color:#6b7280}
+canvas{max-width:900px;max-height:350px;margin:20px 0}
+.badge{padding:2px 8px;border-radius:4px;font-size:0.85em}
+.badge-asian{background:#1e3a5f;color:#60a5fa}.badge-europe{background:#1e3a1e;color:#86efac}
+.badge-us{background:#3f1e1e;color:#fca5a5}</style></head><body>
+<h2>Trading Bot v7.2 — Multi-Strategy + Regime Detection</h2>
 <div id="stats"></div>
 <canvas id="c"></canvas>
 <script>
 fetch('/stats').then(r=>r.json()).then(s=>{
-  let h='<p>Equity: $'+s.equity+' | Daily PnL: $'+s.daily_pnl+' | Fills: '+s.daily_fills+' | WR: '+s.daily_win_rate+' | Up: '+s.uptime_min+'m</p>';
-  h+='<h3>Binance MM (Multi-TF OFI + Mean Reversion)</h3>';
-  h+='<table><tr><th>Pair</th><th>Pos</th><th>PnL</th><th>Fills</th><th>WR</th><th>OFI</th><th>1s/5s/30s</th><th>Wts</th><th>VWAP</th><th>Spread</th><th>Status</th></tr>';
+  let sess = s.session||{};
+  let sc = sess.name==='asian'?'badge-asian':sess.name==='us'?'badge-us':'badge-europe';
+  let h='<p>Equity: $'+s.equity+' | Daily PnL: $'+s.daily_pnl+' | Fills: '+s.daily_fills+' | WR: '+s.daily_win_rate+' | Up: '+s.uptime_min+'m';
+  h+=' | Session: <span class="badge '+sc+'">'+sess.name+'</span> (thresh:'+((sess.threshold_mult||1)*100).toFixed(0)+'% size:'+(sess.size_mult||1).toFixed(1)+'x mom:'+sess.mom_req+')</p>';
+  h+='<h3>Binance MM (Multi-TF OFI + Regime + Session)</h3>';
+  h+='<table><tr><th>Pair</th><th>Pos</th><th>PnL</th><th>Fills</th><th>WR</th><th>OFI</th><th>Regime</th><th>VR</th><th>Inst.Flow</th><th>Tox</th><th>Spread</th><th>Status</th></tr>';
   for(let[k,v] of Object.entries(s.pairs||{})){
     let pc=v.pnl>=0?'pos':'neg';
+    let rc=v.regime==='trending'?'trend':v.regime==='ranging'?'range':'neutral';
     h+='<tr><td>'+k+'</td><td class="'+(v.position>=0?'pos':'neg')+'">$'+v.position+'</td>';
     h+='<td class="'+pc+'">$'+v.pnl.toFixed(4)+'</td><td>'+v.fills+'</td><td>'+v.win_rate+'</td>';
-    h+='<td>'+v.ofi+'</td><td class="dim">'+v.ofi_1s+'/'+v.ofi_5s+'/'+v.ofi_30s+'</td>';
-    h+='<td class="dim">'+(v.ofi_weights||[]).join('/')+'</td>';
-    h+='<td>'+(v.vwap_dev||0)+'bp</td>';
+    h+='<td>'+v.ofi+'</td>';
+    h+='<td class="'+rc+'">'+v.regime+' </td><td class="dim">'+v.variance_ratio+'</td>';
+    h+='<td>'+(v.institutional_flow>0.5?'🏦':v.institutional_flow>0.2?'📊':'')+(v.institutional_flow||0).toFixed(1)+'</td>';
+    h+='<td class="'+(v.toxicity>0.2?'pos':v.toxicity<-0.2?'neg':'dim')+'">'+(v.toxicity||0).toFixed(2)+'</td>';
     h+='<td>'+v.spread_bps.toFixed(1)+'bp</td>';
     h+='<td>'+(v.paused?'⏸':'✅')+'</td></tr>';}
   h+='</table>';

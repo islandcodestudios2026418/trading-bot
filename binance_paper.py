@@ -36,6 +36,27 @@ PAUSE_SECONDS = 300
 STATS_FILE = os.getenv("STATS_FILE", "stats.json")
 
 
+def _get_session() -> str:
+    """Detect trading session based on UTC hour."""
+    h = datetime.now(timezone.utc).hour
+    if 0 <= h < 8:
+        return "asian"   # ranging, lower vol
+    elif 8 <= h < 13:
+        return "europe"  # transition, moderate
+    else:
+        return "us"      # trending, higher vol
+
+SESSION_PARAMS = {
+    "asian":  {"threshold_mult": 1.2, "size_mult": 0.7, "mom_req": 4},  # stricter, smaller
+    "europe": {"threshold_mult": 1.0, "size_mult": 1.0, "mom_req": 3},  # baseline
+    "us":     {"threshold_mult": 0.8, "size_mult": 1.3, "mom_req": 2},  # easier entry, bigger size
+}
+
+# Cross-pair correlation: shared OFI state
+_pair_ofi: dict[str, float] = {}  # symbol → last OFI
+_current_session: str = "europe"
+
+
 @dataclass
 class OFITracker:
     """Multi-timeframe OFI: exponential moving OFI at 1s/5s/30s with adaptive weights."""
@@ -387,6 +408,24 @@ async def run_pair(symbol: str):
                 ps.regime.update(mid)
                 buy_thresh, sell_thresh = ps.regime.adapt_thresholds(buy_thresh, sell_thresh)
 
+                # Session adaptation: Asian=ranging(strict), US=trending(easy)
+                global _current_session
+                _current_session = _get_session()
+                sp = SESSION_PARAMS[_current_session]
+                buy_thresh *= sp["threshold_mult"]
+                sell_thresh *= sp["threshold_mult"]
+
+                # Cross-pair correlation: BTC+ETH agreement boosts signal
+                _pair_ofi[symbol] = ps.last_ofi
+                btc_ofi = _pair_ofi.get("BTCUSDT", 0)
+                eth_ofi = _pair_ofi.get("ETHUSDT", 0)
+                if btc_ofi != 0 and eth_ofi != 0 and symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
+                    # Both agree on direction = stronger signal
+                    if btc_ofi > 0.1 and eth_ofi > 0.1:
+                        buy_thresh *= 0.7  # correlated bullish → easier long
+                    elif btc_ofi < -0.1 and eth_ofi < -0.1:
+                        sell_thresh *= 0.7  # correlated bearish → easier short
+
                 # Spread regime detection: tight (<5bp) → stricter, wide (>15bp) → relax
                 if ps.last_spread_bps < 5:
                     buy_thresh *= 1.3   # tight spread = less opportunity, require stronger signal
@@ -430,16 +469,17 @@ async def run_pair(symbol: str):
                     # Momentum confirmation: price ticks + aggTrade direction must align
                     tox_confirms_buy = tox > -0.1  # not actively selling
                     tox_confirms_sell = tox < 0.1  # not actively buying
-                    if ps.last_ofi > buy_thresh and ps._momentum >= 3 and tox_confirms_buy:
+                    mom_req = sp["mom_req"]  # session-adaptive momentum requirement
+                    if ps.last_ofi > buy_thresh and ps._momentum >= mom_req and tox_confirms_buy:
                         # Scale size by spread width (wider spread = more edge = bigger size)
                         spread_mult = min(2.0, max(0.5, ps.last_spread_bps / 5.0))
-                        adj_size = size * spread_mult
+                        adj_size = size * spread_mult * sp["size_mult"]
                         ps.position = adj_size
                         ps.entry_price = best_ask
                         log(f"[{symbol}] BUY ${adj_size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
-                    elif ps.last_ofi < sell_thresh and ps._momentum <= -3 and tox_confirms_sell:
+                    elif ps.last_ofi < sell_thresh and ps._momentum <= -mom_req and tox_confirms_sell:
                         spread_mult = min(2.0, max(0.5, ps.last_spread_bps / 5.0))
-                        adj_size = size * spread_mult
+                        adj_size = size * spread_mult * sp["size_mult"]
                         ps.position = -adj_size
                         ps.entry_price = best_bid
                         log(f"[{symbol}] SELL ${adj_size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
