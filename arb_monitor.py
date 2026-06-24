@@ -79,6 +79,8 @@ def _get_stats() -> dict:
             "atr": round(ps.last_atr, 6),
             "vwap_dev": round((ps.mid_prices[-1] - ps.vwap) / ps.vwap * 10000, 1) if ps.vwap and ps.mid_prices else 0,
             "paused": time.time() < ps.paused_until,
+            "regime": ps.regime.regime,
+            "variance_ratio": round(ps.regime.vr, 2),
         }
 
     # Funding arb positions
@@ -167,12 +169,67 @@ fetch('/data').then(r=>r.json()).then(d=>{
 </script></body></html>"""
 
 
+def _get_analytics() -> dict:
+    """Performance analytics: Sharpe, max drawdown, win rate per regime."""
+    import math
+
+    # Equity curve metrics
+    equities = [e["equity"] for e in equity_history]
+    returns = []
+    for i in range(1, len(equities)):
+        if equities[i - 1] > 0:
+            returns.append((equities[i] - equities[i - 1]) / equities[i - 1])
+
+    # Sharpe (annualized, assume ~8640 ticks/day at 10s intervals)
+    sharpe = 0.0
+    if returns:
+        mean_r = sum(returns) / len(returns)
+        var_r = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+        std_r = math.sqrt(var_r) if var_r > 0 else 1e-10
+        sharpe = (mean_r / std_r) * math.sqrt(8640)
+
+    # Max drawdown
+    peak = equities[0] if equities else STARTING_CAPITAL
+    max_dd = 0.0
+    for eq in equities:
+        peak = max(peak, eq)
+        dd = (peak - eq) / peak if peak > 0 else 0
+        max_dd = max(max_dd, dd)
+
+    # Per-regime stats from Binance MM
+    regime_stats = {}
+    try:
+        from binance_paper import pair_states
+        from regime import TRENDING, RANGING, NEUTRAL
+        agg = {TRENDING: {"fills": 0, "pnl": 0.0}, RANGING: {"fills": 0, "pnl": 0.0}, NEUTRAL: {"fills": 0, "pnl": 0.0}}
+        for ps in pair_states.values():
+            for r in [TRENDING, RANGING, NEUTRAL]:
+                agg[r]["fills"] += ps.regime.regime_fills.get(r, 0)
+                agg[r]["pnl"] += ps.regime.regime_pnl.get(r, 0.0)
+        for r, v in agg.items():
+            regime_stats[r] = {"fills": v["fills"], "pnl": round(v["pnl"], 4),
+                               "avg": round(v["pnl"] / v["fills"], 6) if v["fills"] > 0 else 0}
+    except (ImportError, Exception):
+        pass
+
+    return {
+        "sharpe": round(sharpe, 2),
+        "max_drawdown_pct": round(max_dd * 100, 2),
+        "total_returns": len(returns),
+        "equity_current": equities[-1] if equities else STARTING_CAPITAL,
+        "regime": regime_stats,
+        "uptime_h": round((time.time() - _start_time) / 3600, 1),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/data":
             self._json(equity_history[-500:])
         elif self.path == "/stats":
             self._json(_get_stats())
+        elif self.path == "/analytics":
+            self._json(_get_analytics())
         elif self.path == "/health":
             uptime_s = time.time() - _start_time
             self._json({"status": "ok", "uptime_s": int(uptime_s), "uptime_h": round(uptime_s / 3600, 1)})

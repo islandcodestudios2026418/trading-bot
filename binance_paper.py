@@ -11,6 +11,8 @@ from datetime import datetime, timezone, timedelta
 
 import websockets
 
+from regime import RegimeDetector
+
 TW_TZ = timezone(timedelta(hours=8))
 
 try:
@@ -129,6 +131,8 @@ class PairState:
     _prev_mid: float = 0.0
     # Trailing stop
     _best_pnl: float = 0.0  # best unrealized PnL since entry
+    # Regime detection
+    regime: RegimeDetector = field(default_factory=RegimeDetector)
 
     @property
     def wr(self):
@@ -251,6 +255,8 @@ def _record(ps: PairState, profit: float):
         ps._recent_losses.append(profit)
     # Adaptive OFI weight learning
     ps.ofi_tracker.record_outcome(profit > 0)
+    # Regime analytics
+    ps.regime.record_fill(profit)
     if profit > 0:
         ps.wins += 1
         daily_wins += 1
@@ -348,6 +354,10 @@ async def run_pair(symbol: str):
                 buy_thresh = ofi_threshold + inv_skew
                 sell_thresh = -ofi_threshold + inv_skew
 
+                # Regime detection: adapt thresholds
+                ps.regime.update(mid)
+                buy_thresh, sell_thresh = ps.regime.adapt_thresholds(buy_thresh, sell_thresh)
+
                 # Spread regime detection: tight (<5bp) → stricter, wide (>15bp) → relax
                 if ps.last_spread_bps < 5:
                     buy_thresh *= 1.3   # tight spread = less opportunity, require stronger signal
@@ -386,12 +396,13 @@ async def run_pair(symbol: str):
                         log(f"[{symbol}] SELL ${size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f} mom={ps._momentum}")
 
                 elif ps.position > 0:
-                    # ATR-based trailing stop + OFI flip
+                    # ATR-based trailing stop + OFI flip (regime-adaptive)
                     spread = best_ask - best_bid
                     pnl_per_unit = (best_bid - ps.entry_price)
                     unrealized = pnl_per_unit / ps.entry_price * ps.position
                     ps._best_pnl = max(ps._best_pnl, unrealized)
-                    trail_dist = atr * 1.5 if atr > 0 else spread * 2
+                    atr_mult = ps.regime.adapt_exit(1.5)
+                    trail_dist = atr * atr_mult if atr > 0 else spread * 2
                     drawdown_from_peak = ps._best_pnl - unrealized
 
                     if ps._best_pnl > 0 and drawdown_from_peak > trail_dist / ps.entry_price * ps.position:
@@ -417,12 +428,13 @@ async def run_pair(symbol: str):
                         ps._best_pnl = 0
 
                 elif ps.position < 0:
-                    # ATR-based trailing stop + OFI flip
+                    # ATR-based trailing stop + OFI flip (regime-adaptive)
                     spread = best_ask - best_bid
                     pnl_per_unit = (ps.entry_price - best_ask)
                     unrealized = pnl_per_unit / ps.entry_price * abs(ps.position)
                     ps._best_pnl = max(ps._best_pnl, unrealized)
-                    trail_dist = atr * 1.5 if atr > 0 else spread * 2
+                    atr_mult = ps.regime.adapt_exit(1.5)
+                    trail_dist = atr * atr_mult if atr > 0 else spread * 2
                     drawdown_from_peak = ps._best_pnl - unrealized
 
                     if ps._best_pnl > 0 and drawdown_from_peak > trail_dist / ps.entry_price * abs(ps.position):

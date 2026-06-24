@@ -1,27 +1,33 @@
 """
-OKX Spot Market Maker — real spread capture with risk management.
-Scans widest-spread pairs, posts maker-only quotes, captures bid-ask.
-Uses risk_manager for sizing + kill switch, okx_client for execution.
+OKX Spot Market Maker v2 — WebSocket-based, real-time requoting.
+Uses public WS for orderbook streams + private WS for instant fill detection.
+Replaces 15s REST polling with sub-second reaction to spread changes.
 """
 import asyncio
+import json
 import os
 import time
 from datetime import datetime, timezone, timedelta
 
+import websockets
+
 from okx_client import (
-    get_orderbook, scan_spreads, place_order, cancel_all,
-    get_balance, get_fills, get_open_orders
+    scan_spreads, place_order, cancel_all, cancel_order,
+    get_balance, _sign, _ts, API_KEY, SECRET, PASSPHRASE, SIMULATED
 )
 from risk_manager import RiskManager
 
 TW_TZ = timezone(timedelta(hours=8))
 
 # Config
-REFRESH_INTERVAL = int(os.getenv("OKX_REFRESH_SEC", "15"))  # requote every N sec
-SCAN_INTERVAL = int(os.getenv("OKX_SCAN_MIN", "10"))  # rescan pairs every N min
-MIN_SPREAD_BPS = float(os.getenv("OKX_MIN_SPREAD", "25"))  # only trade 25bps+ spreads
-MAX_PAIRS = int(os.getenv("OKX_MAX_PAIRS", "3"))  # trade top N pairs
-EDGE_BPS = float(os.getenv("OKX_EDGE_BPS", "3"))  # tighten quotes by 3bps from best
+SCAN_INTERVAL = int(os.getenv("OKX_SCAN_MIN", "10"))
+MIN_SPREAD_BPS = float(os.getenv("OKX_MIN_SPREAD", "25"))
+MAX_PAIRS = int(os.getenv("OKX_MAX_PAIRS", "3"))
+EDGE_BPS = float(os.getenv("OKX_EDGE_BPS", "3"))
+REQUOTE_BPS = float(os.getenv("OKX_REQUOTE_BPS", "5"))  # requote if mid moves > N bps
+
+OKX_WS_PUBLIC = "wss://ws.okx.com:8443/ws/v5/public"
+OKX_WS_PRIVATE = "wss://ws.okx.com:8443/ws/v5/private"
 
 try:
     from arb_monitor import log, record_trade
@@ -29,69 +35,75 @@ except ImportError:
     def log(m): print(f"[{datetime.now(TW_TZ).strftime('%H:%M:%S')}] {m}", flush=True)
     def record_trade(p, source="okx"): pass
 
+try:
+    from telegram_alerts import send as tg_send
+except ImportError:
+    def tg_send(m): pass
 
-class OKXMarketMaker:
+
+class OKXWSMarketMaker:
     def __init__(self):
         self.rm = RiskManager()
         self.active_pairs: list[str] = []
         self.last_scan = 0.0
-        self.fills_count = 0
         self.pnl = 0.0
-        self._inv: dict[str, dict] = {}  # per-instrument inventory for RT tracking
+        self.fills_count = 0
+        # Per-instrument state
+        self._books: dict[str, dict] = {}  # instId → {bid, ask, mid}
+        self._last_quote_mid: dict[str, float] = {}  # mid at last quote
+        self._orders: dict[str, dict] = {}  # ordId → {instId, side, px, sz}
+        self._inv: dict[str, dict] = {}  # instId → {qty, cost}
 
     def _scan_pairs(self):
-        """Find widest-spread pairs to market-make."""
+        """Find widest-spread pairs via REST (periodic, infrequent)."""
         pairs = scan_spreads(min_bps=MIN_SPREAD_BPS)
         self.active_pairs = [p[0] for p in pairs[:MAX_PAIRS]]
         self.last_scan = time.time()
-        log(f"[OKX-MM] Scanning... top {MAX_PAIRS} pairs: {self.active_pairs}")
+        log(f"[OKX-MM] Scanning... top {MAX_PAIRS}: {self.active_pairs}")
         for inst, bps, vol in pairs[:MAX_PAIRS]:
-            log(f"  {inst}: {bps:.0f}bps spread, ${vol:,.0f} vol/24h")
+            log(f"  {inst}: {bps:.0f}bps, ${vol:,.0f}/24h")
+
+    def _should_requote(self, inst_id: str) -> bool:
+        """Requote if mid moved more than REQUOTE_BPS from last quote."""
+        book = self._books.get(inst_id)
+        if not book:
+            return False
+        last_mid = self._last_quote_mid.get(inst_id, 0)
+        if last_mid == 0:
+            return True
+        move = abs(book["mid"] - last_mid) / last_mid * 10000
+        return move >= REQUOTE_BPS
 
     def _quote_pair(self, inst_id: str) -> bool:
-        """Place bid+ask for one pair. Returns True if orders placed."""
+        """Place bid+ask quotes based on current WS book."""
         ok, reason = self.rm.can_trade()
         if not ok:
-            log(f"[OKX-MM] Risk block: {reason}")
             return False
 
-        book = get_orderbook(inst_id, depth=5)
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
-        if not bids or not asks:
+        book = self._books.get(inst_id)
+        if not book or book["bid"] <= 0:
             return False
 
-        best_bid = float(bids[0][0])
-        best_ask = float(asks[0][0])
-        mid = (best_bid + best_ask) / 2
-        spread_bps = (best_ask - best_bid) / mid * 10000
-
+        mid = book["mid"]
+        spread_bps = (book["ask"] - book["bid"]) / mid * 10000
         if spread_bps < MIN_SPREAD_BPS:
             return False
 
-        # Tighten by EDGE_BPS inside the spread
         edge = mid * EDGE_BPS / 10000
-        our_bid = best_bid + edge
-        our_ask = best_ask - edge
+        our_bid = book["bid"] + edge
+        our_ask = book["ask"] - edge
 
-        # Size from risk manager
         size_usd = self.rm.size_order(spread_bps)
         qty = size_usd / mid
-        # Round to reasonable precision
-        if mid > 100:
-            qty_str = f"{qty:.4f}"
-            bid_px = f"{our_bid:.2f}"
-            ask_px = f"{our_ask:.2f}"
-        elif mid > 1:
-            qty_str = f"{qty:.2f}"
-            bid_px = f"{our_bid:.4f}"
-            ask_px = f"{our_ask:.4f}"
-        else:
-            qty_str = f"{qty:.0f}"
-            bid_px = f"{our_bid:.6f}"
-            ask_px = f"{our_ask:.6f}"
 
-        # Cancel existing, then place new quotes
+        # Precision
+        if mid > 100:
+            qty_str, bid_px, ask_px = f"{qty:.4f}", f"{our_bid:.2f}", f"{our_ask:.2f}"
+        elif mid > 1:
+            qty_str, bid_px, ask_px = f"{qty:.2f}", f"{our_bid:.4f}", f"{our_ask:.4f}"
+        else:
+            qty_str, bid_px, ask_px = f"{qty:.0f}", f"{our_bid:.6f}", f"{our_ask:.6f}"
+
         cancel_all(inst_id)
 
         r_bid = place_order(inst_id, "buy", qty_str, bid_px, "post_only")
@@ -102,70 +114,151 @@ class OKXMarketMaker:
 
         if bid_ok or ask_ok:
             self.rm.add_exposure(size_usd)
-            log(f"[OKX-MM] {inst_id} quoted: bid={bid_px} ask={ask_px} sz=${size_usd:.0f} spread={spread_bps:.0f}bps")
-        else:
-            err = r_bid.get("msg", "") or r_ask.get("msg", "")
-            if err:
-                log(f"[OKX-MM] {inst_id} order error: {err}")
-
+            self._last_quote_mid[inst_id] = mid
+            # Track order IDs for fill matching
+            if bid_ok:
+                oid = r_bid.get("data", [{}])[0].get("ordId", "")
+                if oid:
+                    self._orders[oid] = {"instId": inst_id, "side": "buy", "px": our_bid, "sz": qty}
+            if ask_ok:
+                oid = r_ask.get("data", [{}])[0].get("ordId", "")
+                if oid:
+                    self._orders[oid] = {"instId": inst_id, "side": "sell", "px": our_ask, "sz": qty}
+            log(f"[OKX-MM] {inst_id} bid={bid_px} ask={ask_px} sz=${size_usd:.0f} spd={spread_bps:.0f}bps")
         return bid_ok or ask_ok
 
-    def _check_fills(self):
-        """Check recent fills and compute round-trip PnL from matched buy/sell pairs."""
-        fills = get_fills(limit=20)
-        if not fills:
+    def _process_fill(self, data: dict):
+        """Process fill from private WS orders channel."""
+        state = data.get("state", "")
+        if state != "filled" and state != "partially_filled":
             return
-        new_count = len(fills)
-        if new_count <= self.fills_count:
+
+        inst = data.get("instId", "")
+        side = data.get("side", "")
+        fill_px = float(data.get("fillPx") or data.get("avgPx") or "0")
+        fill_sz = float(data.get("fillSz") or data.get("accFillSz") or "0")
+        fee = float(data.get("fee") or "0")
+
+        if not inst or fill_px <= 0:
             return
-        added = new_count - self.fills_count
-        self.fills_count = new_count
 
-        for f in fills[:added]:
-            inst = f.get("instId", "")
-            side = f.get("side", "")
-            px = float(f.get("fillPx", "0"))
-            sz = float(f.get("fillSz", "0"))
-            fee = float(f.get("fee", "0"))
+        # Round-trip PnL tracking
+        if inst not in self._inv:
+            self._inv[inst] = {"qty": 0.0, "cost": 0.0}
+        inv = self._inv[inst]
 
-            if not inst or not px:
+        if side == "buy":
+            inv["cost"] += fill_px * fill_sz
+            inv["qty"] += fill_sz
+            log(f"[OKX-MM] FILL BUY {inst} {fill_sz}@{fill_px}")
+        elif side == "sell" and inv["qty"] > 0:
+            avg_entry = inv["cost"] / inv["qty"]
+            close_qty = min(fill_sz, inv["qty"])
+            pnl = (fill_px - avg_entry) * close_qty + fee
+            inv["qty"] -= close_qty
+            inv["cost"] -= avg_entry * close_qty
+            self.pnl += pnl
+            self.fills_count += 1
+            self.rm.record_trade(pnl)
+            record_trade(pnl, source="okx")
+            log(f"[OKX-MM] RT {inst}: entry={avg_entry:.4f} exit={fill_px:.4f} pnl=${pnl:.4f} total=${self.pnl:.4f}")
+        else:
+            inv["cost"] -= fill_px * fill_sz
+            inv["qty"] -= fill_sz
+            log(f"[OKX-MM] FILL SELL {inst} {fill_sz}@{fill_px}")
+
+    async def _ws_orderbook(self):
+        """Subscribe to real-time orderbook for active pairs."""
+        while True:
+            if not self.active_pairs:
+                await asyncio.sleep(5)
                 continue
+            args = [{"channel": "books5", "instId": inst} for inst in self.active_pairs]
+            try:
+                async with websockets.connect(OKX_WS_PUBLIC, ssl=True) as ws:
+                    await ws.send(json.dumps({"op": "subscribe", "args": args}))
+                    log(f"[OKX-MM] WS orderbook connected: {self.active_pairs}")
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        data = msg.get("data", [])
+                        if not data:
+                            continue
+                        d = data[0]
+                        inst = msg.get("arg", {}).get("instId", "")
+                        bids = d.get("bids", [])
+                        asks = d.get("asks", [])
+                        if bids and asks:
+                            bid = float(bids[0][0])
+                            ask = float(asks[0][0])
+                            self._books[inst] = {"bid": bid, "ask": ask, "mid": (bid + ask) / 2}
+            except Exception as e:
+                log(f"[OKX-MM] WS book error: {e}, reconnecting...")
+                await asyncio.sleep(3)
 
-            # Track per-instrument inventory to match round trips
-            if inst not in self._inv:
-                self._inv[inst] = {"qty": 0.0, "cost": 0.0}
-            inv = self._inv[inst]
+    async def _ws_private(self):
+        """Subscribe to private orders channel for instant fill detection."""
+        if not API_KEY:
+            return
+        while True:
+            try:
+                async with websockets.connect(OKX_WS_PRIVATE, ssl=True) as ws:
+                    # Authenticate
+                    ts = str(int(time.time()))
+                    sign_str = f"{ts}GET/users/self/verify"
+                    import hmac as _hmac, hashlib, base64
+                    sig = base64.b64encode(
+                        _hmac.new(SECRET.encode(), sign_str.encode(), hashlib.sha256).digest()
+                    ).decode()
+                    login = {"op": "login", "args": [{
+                        "apiKey": API_KEY, "passphrase": PASSPHRASE,
+                        "timestamp": ts, "sign": sig
+                    }]}
+                    await ws.send(json.dumps(login))
+                    resp = json.loads(await ws.recv())
+                    if resp.get("event") != "login" or resp.get("code") != "0":
+                        log(f"[OKX-MM] WS private login failed: {resp}")
+                        await asyncio.sleep(30)
+                        continue
 
-            if side == "buy":
-                inv["cost"] += px * sz
-                inv["qty"] += sz
-            elif side == "sell" and inv["qty"] > 0:
-                # Close: compute PnL from avg entry
-                avg_entry = inv["cost"] / inv["qty"] if inv["qty"] > 0 else px
-                close_qty = min(sz, inv["qty"])
-                pnl = (px - avg_entry) * close_qty + fee
-                inv["qty"] -= close_qty
-                inv["cost"] -= avg_entry * close_qty
-                self.pnl += pnl
-                self.rm.record_trade(pnl)
-                record_trade(pnl, source="okx")
-                log(f"[OKX-MM] RT {inst}: entry={avg_entry:.6f} exit={px:.6f} pnl=${pnl:.4f}")
-            else:
-                # Sell without inventory = short open, track negative
-                inv["cost"] -= px * sz
-                inv["qty"] -= sz
+                    # Subscribe to orders
+                    sub = {"op": "subscribe", "args": [{"channel": "orders", "instType": "SPOT"}]}
+                    await ws.send(json.dumps(sub))
+                    log("[OKX-MM] WS private connected (fills channel)")
 
-        log(f"[OKX-MM] {added} new fills | cumulative PnL: ${self.pnl:.4f}")
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        for d in msg.get("data", []):
+                            self._process_fill(d)
+            except Exception as e:
+                log(f"[OKX-MM] WS private error: {e}, reconnecting...")
+                await asyncio.sleep(5)
+
+    async def _requote_loop(self):
+        """Check if any pair needs requoting based on mid movement."""
+        while True:
+            await asyncio.sleep(2)  # check every 2s (vs old 15s REST)
+            ok, _ = self.rm.can_trade()
+            if not ok:
+                continue
+            for inst in self.active_pairs:
+                if self._should_requote(inst):
+                    self._quote_pair(inst)
+                    await asyncio.sleep(0.5)  # rate limit between pairs
+
+    async def _scan_loop(self):
+        """Periodically rescan for best spread pairs."""
+        while True:
+            self._scan_pairs()
+            await asyncio.sleep(SCAN_INTERVAL * 60)
 
 
 async def run():
-    """Main OKX MM loop."""
-    mm = OKXMarketMaker()
-    log("[OKX-MM] Starting OKX Market Maker...")
+    """Main OKX MM — WebSocket-based."""
+    mm = OKXWSMarketMaker()
+    log("[OKX-MM] Starting WebSocket-based Market Maker v2...")
 
-    # Check if API keys are configured
     if not os.getenv("OKX_API_KEY"):
-        log("[OKX-MM] No OKX_API_KEY set — running in scan-only mode")
+        log("[OKX-MM] No OKX_API_KEY — scan-only mode")
         while True:
             mm._scan_pairs()
             await asyncio.sleep(600)
@@ -173,40 +266,14 @@ async def run():
 
     balance = get_balance("USDT")
     log(f"[OKX-MM] USDT balance: ${balance:.2f}")
+    mm._scan_pairs()
 
-    while True:
-        try:
-            # Rescan pairs periodically
-            if time.time() - mm.last_scan > SCAN_INTERVAL * 60:
-                mm._scan_pairs()
-
-            if not mm.active_pairs:
-                await asyncio.sleep(60)
-                continue
-
-            # Quote each active pair
-            for inst in mm.active_pairs:
-                mm._quote_pair(inst)
-                await asyncio.sleep(1)  # rate limit
-
-            # Check for fills
-            mm._check_fills()
-
-            # Status
-            ok, reason = mm.rm.can_trade()
-            if not ok:
-                log(f"[OKX-MM] {mm.rm.status()}")
-                # Cancel all orders if killed
-                for inst in mm.active_pairs:
-                    cancel_all(inst)
-                await asyncio.sleep(300)  # wait 5min before retry
-                continue
-
-            await asyncio.sleep(REFRESH_INTERVAL)
-
-        except Exception as e:
-            log(f"[OKX-MM] Error: {e}")
-            await asyncio.sleep(30)
+    await asyncio.gather(
+        mm._ws_orderbook(),
+        mm._ws_private(),
+        mm._requote_loop(),
+        mm._scan_loop(),
+    )
 
 
 if __name__ == "__main__":
