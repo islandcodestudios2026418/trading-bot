@@ -20,6 +20,31 @@ PASSPHRASE = os.getenv("OKX_PASSPHRASE", "")
 SIMULATED = os.getenv("OKX_SIMULATED", "1")  # "1" for demo trading, "0" for real
 
 
+class RateLimiter:
+    """Token bucket rate limiter. OKX: 20 req/2s for trade endpoints."""
+    def __init__(self, rate: int = 20, per: float = 2.0):
+        self.rate = rate
+        self.per = per
+        self.tokens = rate
+        self.last = time.time()
+
+    def acquire(self):
+        """Block until a token is available."""
+        now = time.time()
+        elapsed = now - self.last
+        self.tokens = min(self.rate, self.tokens + elapsed * (self.rate / self.per))
+        self.last = now
+        if self.tokens < 1:
+            wait = (1 - self.tokens) * (self.per / self.rate)
+            time.sleep(wait)
+            self.tokens = 0
+        else:
+            self.tokens -= 1
+
+
+_rate_limiter = RateLimiter(rate=18, per=2.0)  # 18/2s (safety margin from 20)
+
+
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
@@ -53,6 +78,7 @@ def _get(path: str, params: dict = None) -> dict:
 
 
 def _post(path: str, body: list | dict) -> dict:
+    _rate_limiter.acquire()
     body_str = json.dumps(body)
     r = requests.post(f"{BASE_URL}{path}", headers=_headers("POST", path, body_str),
                       data=body_str, timeout=10)

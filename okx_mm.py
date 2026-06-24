@@ -51,8 +51,12 @@ class OKXWSMarketMaker:
         # Per-instrument state
         self._books: dict[str, dict] = {}  # instId → {bid, ask, mid}
         self._last_quote_mid: dict[str, float] = {}  # mid at last quote
+        self._last_quote_time: dict[str, float] = {}  # time of last quote
         self._orders: dict[str, dict] = {}  # ordId → {instId, side, px, sz}
         self._inv: dict[str, dict] = {}  # instId → {qty, cost}
+        # Fill-rate adaptive spread: track how fast quotes get filled
+        self._fill_rate: dict[str, float] = {}  # instId → fill_rate (0-1)
+        self._edge_mult: dict[str, float] = {}  # instId → edge multiplier (0.5-3.0)
 
     def _scan_pairs(self):
         """Find widest-spread pairs via REST (periodic, infrequent)."""
@@ -89,7 +93,10 @@ class OKXWSMarketMaker:
         if spread_bps < MIN_SPREAD_BPS:
             return False
 
-        edge = mid * EDGE_BPS / 10000
+        # Tighten by adaptive EDGE_BPS (adjusted by fill rate)
+        edge_mult = self._edge_mult.get(inst_id, 1.0)
+        effective_edge = EDGE_BPS * edge_mult
+        edge = mid * effective_edge / 10000
         our_bid = book["bid"] + edge
         our_ask = book["ask"] - edge
 
@@ -126,11 +133,12 @@ class OKXWSMarketMaker:
         if placed > 0:
             self.rm.add_exposure(size_usd)
             self._last_quote_mid[inst_id] = mid
-            log(f"[OKX-MM] {inst_id} bid={bid_px} ask={ask_px} sz=${size_usd:.0f} spd={spread_bps:.0f}bps ({placed}/2 placed)")
+            self._last_quote_time[inst_id] = time.time()
+            log(f"[OKX-MM] {inst_id} bid={bid_px} ask={ask_px} sz=${size_usd:.0f} spd={spread_bps:.0f}bps edge={effective_edge:.1f}bps ({placed}/2 placed)")
         return placed > 0
 
     def _process_fill(self, data: dict):
-        """Process fill from private WS orders channel."""
+        """Process fill from private WS orders channel + adapt edge."""
         state = data.get("state", "")
         if state != "filled" and state != "partially_filled":
             return
@@ -143,6 +151,17 @@ class OKXWSMarketMaker:
 
         if not inst or fill_px <= 0:
             return
+
+        # Fill-rate adaptive spread: track time between quote and fill
+        quote_time = self._last_quote_time.get(inst, 0)
+        if quote_time > 0:
+            time_to_fill = time.time() - quote_time
+            # Fast fill (<5s) → too tight, widen. Slow fill (>30s) → too wide, tighten.
+            if time_to_fill < 5:
+                self._edge_mult[inst] = min(3.0, self._edge_mult.get(inst, 1.0) * 1.1)
+            elif time_to_fill > 30:
+                self._edge_mult[inst] = max(0.5, self._edge_mult.get(inst, 1.0) * 0.9)
+            log(f"[OKX-MM] Fill rate: {inst} filled in {time_to_fill:.1f}s → edge_mult={self._edge_mult.get(inst, 1.0):.2f}")
 
         # Round-trip PnL tracking
         if inst not in self._inv:
