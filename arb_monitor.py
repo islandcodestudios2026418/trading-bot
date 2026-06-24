@@ -252,6 +252,22 @@ def _check_arb(tid: str, best_asks: dict, token_pairs: dict):
         if profit_pct >= MIN_PROFIT_PCT:
             trade_size = min(100, STARTING_CAPITAL * 0.05)
             profit_usd = (1.0 - total) * trade_size
+
+            # Attempt real execution
+            try:
+                from polymarket_exec import execute_arb, is_ready
+                if is_ready():
+                    result = execute_arb(tid, pair_tid, best_asks[tid], best_asks[pair_tid], info['q'])
+                    if result and "error" not in result:
+                        log(f"🎯 ARB EXECUTED: {info['q']} | {total:.4f} | +{profit_pct:.1f}%")
+                        record_trade(profit_usd, source="poly")
+                    elif result:
+                        log(f"⚠️ ARB exec error: {result.get('error')}")
+                    return
+            except ImportError:
+                pass
+
+            # Paper trade fallback
             record_trade(profit_usd, source="poly")
             send_alert(f"ARB: {info['q']} | {total:.4f} | +${profit_usd:.2f}")
             try:

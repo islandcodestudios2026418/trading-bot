@@ -34,6 +34,30 @@ PAUSE_SECONDS = 300
 
 
 @dataclass
+class OFITracker:
+    """Multi-timeframe OFI: exponential moving OFI at 1s/5s/30s."""
+    # EMA half-lives in seconds (at 100ms tick = 10/50/300 ticks)
+    ofi_1s: float = 0.0
+    ofi_5s: float = 0.0
+    ofi_30s: float = 0.0
+    last_bid_vol: float = 0.0
+    last_ask_vol: float = 0.0
+    _alpha_1s: float = 1 - 0.93  # ~10 tick half-life
+    _alpha_5s: float = 1 - 0.986  # ~50 tick half-life
+    _alpha_30s: float = 1 - 0.998  # ~300 tick half-life
+
+    def update(self, bid_vol: float, ask_vol: float) -> float:
+        """Update with new depth snapshot. Returns weighted composite OFI."""
+        total = bid_vol + ask_vol
+        raw_ofi = (bid_vol - ask_vol) / total if total > 0 else 0
+        self.ofi_1s += self._alpha_1s * (raw_ofi - self.ofi_1s)
+        self.ofi_5s += self._alpha_5s * (raw_ofi - self.ofi_5s)
+        self.ofi_30s += self._alpha_30s * (raw_ofi - self.ofi_30s)
+        # Weighted: short-term signal + trend confirmation
+        return 0.5 * self.ofi_1s + 0.3 * self.ofi_5s + 0.2 * self.ofi_30s
+
+
+@dataclass
 class PairState:
     symbol: str
     position: float = 0.0
@@ -43,14 +67,22 @@ class PairState:
     wins: int = 0
     paused_until: float = 0.0
     consec_losses: int = 0
-    mid_prices: deque = field(default_factory=lambda: deque(maxlen=100))
+    mid_prices: deque = field(default_factory=lambda: deque(maxlen=300))
     last_atr: float = 0.0
     last_ofi: float = 0.0
     last_spread_bps: float = 0.0
+    ofi_tracker: OFITracker = field(default_factory=OFITracker)
+    # Mean-reversion: VWAP anchor
+    vwap_num: float = 0.0
+    vwap_den: float = 0.0
 
     @property
     def wr(self):
         return f"{self.wins/self.fills*100:.0f}%" if self.fills else "-"
+
+    @property
+    def vwap(self):
+        return self.vwap_num / self.vwap_den if self.vwap_den > 0 else 0
 
 
 # Global state shared with dashboard
@@ -155,11 +187,15 @@ async def run_pair(symbol: str):
                 ps.mid_prices.append(mid)
                 ps.last_spread_bps = (best_ask - best_bid) / mid * 10000
 
-                # OFI: sum bid qty vs ask qty across top 5 levels
+                # Multi-timeframe OFI (1s/5s/30s weighted)
                 bid_vol = sum(float(b[1]) * float(b[0]) for b in bids)
                 ask_vol = sum(float(a[1]) * float(a[0]) for a in asks)
-                total_vol = bid_vol + ask_vol
-                ps.last_ofi = (bid_vol - ask_vol) / total_vol if total_vol > 0 else 0
+                ps.last_ofi = ps.ofi_tracker.update(bid_vol, ask_vol)
+
+                # Update VWAP anchor for mean-reversion
+                tick_vol = bid_vol + ask_vol
+                ps.vwap_num += mid * tick_vol
+                ps.vwap_den += tick_vol
 
                 # ATR volatility filter
                 atr = _calc_atr(ps.mid_prices)
@@ -183,11 +219,23 @@ async def run_pair(symbol: str):
                     size = base_size
 
                 # OFI-biased entry with inventory skew (Avellaneda-Stoikov)
-                # When holding inventory, bias thresholds to favor unwinding
+                # + Mean-reversion overlay: fade extended moves from VWAP
                 ofi_threshold = 0.3
-                inv_skew = (ps.position / MAX_POS_USD) * 0.2  # [-0.2, 0.2] skew
-                buy_thresh = ofi_threshold + inv_skew   # harder to buy when long
-                sell_thresh = -ofi_threshold + inv_skew  # easier to sell when long
+                inv_skew = (ps.position / MAX_POS_USD) * 0.2
+                buy_thresh = ofi_threshold + inv_skew
+                sell_thresh = -ofi_threshold + inv_skew
+
+                # Mean-reversion signal: lower threshold when price extended from VWAP
+                mr_signal = 0
+                spread = best_ask - best_bid
+                if ps.vwap > 0 and spread > 0:
+                    dev = (mid - ps.vwap) / spread  # deviation in spread units
+                    if dev < -1.5:  # price below VWAP — bullish reversion
+                        mr_signal = 1
+                        buy_thresh *= 0.6  # easier to enter long
+                    elif dev > 1.5:  # price above VWAP — bearish reversion
+                        mr_signal = -1
+                        sell_thresh *= 0.6  # easier to enter short
 
                 if ps.position == 0:
                     if ps.last_ofi > buy_thresh:

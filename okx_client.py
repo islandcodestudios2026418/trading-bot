@@ -101,17 +101,20 @@ def get_balance(ccy: str = "USDT") -> float:
 
 
 def place_order(inst_id: str, side: str, sz: str, px: str = None,
-                order_type: str = "limit") -> dict:
-    """Place a spot order. side='buy'|'sell', order_type='limit'|'market'|'post_only'"""
+                order_type: str = "limit", td_mode: str = "cash",
+                pos_side: str = "") -> dict:
+    """Place an order. td_mode='cash' for spot, 'cross'/'isolated' for perps."""
     body = {
         "instId": inst_id,
-        "tdMode": "cash",
+        "tdMode": td_mode,
         "side": side,
         "ordType": "post_only" if order_type == "post_only" else order_type,
         "sz": sz,
     }
     if px and order_type != "market":
         body["px"] = px
+    if pos_side:
+        body["posSide"] = pos_side
     return _post("/api/v5/trade/order", body)
 
 
