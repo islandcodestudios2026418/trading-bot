@@ -75,6 +75,13 @@ async def main():
     if stop.is_set():
         log("🛑 Shutdown signal received — stopping gracefully")
         tg_send("🛑 Bot stopping (signal)")
+        # Save stats before exit
+        try:
+            from binance_paper import _save_stats
+            _save_stats()
+            log("💾 Stats saved on shutdown")
+        except Exception:
+            pass
         done.cancel()
         try:
             await done

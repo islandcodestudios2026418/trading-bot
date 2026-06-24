@@ -111,6 +111,10 @@ class OFITracker:
     # Institutional flow detection (iceberg/order splitting)
     _recent_trades: deque = field(default_factory=lambda: deque(maxlen=50))
     institutional_flow: float = 0.0  # 0-1 score, >0.5 = likely institutional
+    # Volume surge detection
+    _vol_ema: float = 0.0  # 30s EMA of volume per tick
+    _vol_alpha: float = 1 - 0.97  # ~30 tick half-life at 1 trade/sec
+    volume_surge: float = 1.0  # current_vol / ema_vol, >3.0 = surge
     # Depth pressure gradient
     depth_pressure: float = 0.0  # >0 = bid wall (support), <0 = ask wall (resistance)
     # Quote stuffing/spoofing detection
@@ -170,6 +174,11 @@ class OFITracker:
 
     def update_trade(self, qty_usd: float, is_buyer_maker: bool, ts_ms: float = 0):
         """Update trade flow from aggTrade stream + detect institutional splitting."""
+        # Volume surge detection: compare current vol to EMA
+        if self._vol_ema > 0:
+            self.volume_surge = qty_usd / self._vol_ema
+        self._vol_ema += self._vol_alpha * (qty_usd - self._vol_ema)
+
         if is_buyer_maker:
             self._sell_vol += self._flow_alpha * (qty_usd - self._sell_vol)
         else:
@@ -358,6 +367,7 @@ def _halt_check() -> bool:
         if not _halted:
             log(f"⛔ DAILY LOSS LIMIT hit: ${daily_pnl:.2f} <= -${DAILY_LOSS_LIMIT}")
             alert_kill(f"Daily loss ${daily_pnl:.2f} <= -${DAILY_LOSS_LIMIT}")
+            _save_stats()  # persist before halt
             _halted = True
         return True
     return False
@@ -404,6 +414,9 @@ def _record(ps: PairState, profit: float):
             log(f"{ps.symbol} paused {PAUSE_SECONDS}s after {CONSEC_LOSS_PAUSE} consecutive losses")
             alert_trade(ps.symbol, "PAUSED", net_profit, daily_pnl)
     record_trade(net_profit)
+    # Periodic stats persistence (every 100 fills)
+    if daily_fills % 100 == 0:
+        _save_stats()
     # Alert every 10th fill or on significant loss
     if daily_fills % 10 == 0 or profit < -0.01:
         alert_trade(ps.symbol, "FILL", profit, daily_pnl)
@@ -571,6 +584,13 @@ async def run_pair(symbol: str):
                 if ps.ofi_tracker.spoof_score > 0.5:
                     buy_thresh *= 1.5
                     sell_thresh *= 1.5
+
+                # Volume surge: 3x+ volume predicts breakout — lower threshold
+                if ps.ofi_tracker.volume_surge > 3.0:
+                    if ps.last_ofi > 0.1:
+                        buy_thresh *= 0.5  # surge + bullish OFI = strong buy signal
+                    elif ps.last_ofi < -0.1:
+                        sell_thresh *= 0.5  # surge + bearish OFI = strong sell signal
 
                 if ps.position == 0:
                     # Momentum confirmation: price ticks + aggTrade direction must align
