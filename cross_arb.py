@@ -43,6 +43,10 @@ _trades = 0
 # Adaptive trigger: track recent divergence history
 _div_history: dict[str, deque] = {}  # symbol → recent abs(div_bps)
 _binance_depth: dict[str, tuple] = {}  # symbol → (bid_depth_usd, ask_depth_usd) at top 5
+# Cointegration z-score: spread mean + std for z-score trigger
+_spread_history: dict[str, deque] = {}  # symbol → recent signed spread (bps)
+Z_SCORE_TRIGGER = float(os.getenv("CROSS_ARB_ZSCORE", "2.0"))  # enter when |z| > 2.0
+Z_SCORE_EXIT = float(os.getenv("CROSS_ARB_ZEXIT", "0.5"))  # exit when |z| < 0.5
 
 
 def _symbol_to_okx(sym: str) -> str:
@@ -76,7 +80,7 @@ def _execute_on_okx(inst_id: str, side: str, mid: float, div_bps: float) -> bool
 
 
 def _check_divergence(symbol: str):
-    """Check if Binance-OKX divergence exceeds adaptive threshold."""
+    """Check if Binance-OKX spread z-score exceeds threshold (cointegration mean-reversion)."""
     global _pnl, _trades
 
     b_mid = _binance_mids.get(symbol, 0)
@@ -90,26 +94,41 @@ def _check_divergence(symbol: str):
 
     div_bps = (b_mid - o_mid) / o_mid * 10000
 
-    # Track divergence history for adaptive trigger
+    # Track spread history for z-score calculation
+    if symbol not in _spread_history:
+        _spread_history[symbol] = deque(maxlen=1000)
+    _spread_history[symbol].append(div_bps)
+
+    # Track abs divergence for adaptive trigger (fallback)
     if symbol not in _div_history:
         _div_history[symbol] = deque(maxlen=500)
     _div_history[symbol].append(abs(div_bps))
 
-    # Adaptive trigger: 1.5x recent average divergence, minimum TRIGGER_BPS
-    hist = _div_history[symbol]
-    if len(hist) >= 50:
-        avg_div = sum(hist) / len(hist)
-        adaptive_trigger = max(TRIGGER_BPS, avg_div * 1.5)
+    # Z-score trigger: requires enough history
+    hist = _spread_history[symbol]
+    if len(hist) >= 100:
+        mean_spread = sum(hist) / len(hist)
+        var_spread = sum((x - mean_spread) ** 2 for x in hist) / len(hist)
+        std_spread = var_spread ** 0.5
+        if std_spread > 0:
+            z_score = (div_bps - mean_spread) / std_spread
+        else:
+            z_score = 0
+        # Only trade when z-score exceeds threshold (statistically significant deviation)
+        if abs(z_score) < Z_SCORE_TRIGGER:
+            return
     else:
-        adaptive_trigger = TRIGGER_BPS
-
-    if abs(div_bps) < adaptive_trigger:
-        return
+        # Fallback to adaptive bps trigger during warmup
+        avg_div = sum(_div_history[symbol]) / len(_div_history[symbol]) if len(_div_history[symbol]) >= 50 else TRIGGER_BPS
+        adaptive_trigger = max(TRIGGER_BPS, avg_div * 1.5)
+        if abs(div_bps) < adaptive_trigger:
+            return
+        z_score = div_bps / max(1, adaptive_trigger)  # pseudo z-score
 
     # Depth-aware sizing: don't trade more than 30% of available depth
     depth = _binance_depth.get(symbol, (0, 0))
     side = "buy" if div_bps > 0 else "sell"
-    available_depth = depth[0] if side == "buy" else depth[1]  # bid/ask depth on OKX side
+    available_depth = depth[0] if side == "buy" else depth[1]
     if available_depth > 0:
         max_size = available_depth * 0.3
         trade_size = min(SIZE_USD, max_size)
@@ -124,7 +143,7 @@ def _check_divergence(symbol: str):
     _last_trade[symbol] = time.time()
     record_trade(est_profit, source="cross")
     mode = "" if ok else "(paper) "
-    log(f"[CROSS-ARB] {symbol} {side.upper()} {mode}| div={div_bps:+.1f}bps (trigger={adaptive_trigger:.1f}) | sz=${trade_size:.0f} | est=${est_profit:.4f} | total=${_pnl:.4f}")
+    log(f"[CROSS-ARB] {symbol} {side.upper()} {mode}| z={z_score:+.2f} div={div_bps:+.1f}bps | sz=${trade_size:.0f} | est=${est_profit:.4f} | total=${_pnl:.4f}")
 
 
 async def _stream_okx():

@@ -133,8 +133,18 @@ class OKXWSMarketMaker:
         # Dynamic edge: volatility + inventory risk + fill-rate adaptive
         effective_edge = self._dynamic_edge(inst_id)
         edge = mid * effective_edge / 10000
-        our_bid = book["bid"] + edge
-        our_ask = book["ask"] - edge
+
+        # Inventory skew (Avellaneda-Stoikov): shift quotes to reduce position
+        inv = self._inv.get(inst_id, {"qty": 0, "cost": 0})
+        inv_qty = inv.get("qty", 0)
+        inv_usd = inv_qty * mid
+        # Skew: proportional to inventory / max_pos. Range [-1, 1]
+        max_inv = 200  # max expected inventory USD
+        skew = max(-1.0, min(1.0, inv_usd / max_inv))
+        # Positive skew (long) → tighter ask (encourage sell), wider bid
+        skew_amount = edge * skew * 0.5  # max 50% of edge as skew
+        our_bid = book["bid"] + edge - skew_amount  # wider when long
+        our_ask = book["ask"] - edge - skew_amount  # tighter when long
 
         size_usd = self.rm.size_order(spread_bps)
         qty = size_usd / mid

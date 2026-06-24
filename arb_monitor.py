@@ -263,6 +263,35 @@ def _get_analytics() -> dict:
     }
 
 
+def _get_metrics() -> dict:
+    """Real-time signal metrics: VPIN, OBI, arrival intensity, regime, Hurst per symbol."""
+    metrics = {}
+    try:
+        from binance_paper import pair_states
+        for sym, ps in pair_states.items():
+            ot = ps.ofi_tracker
+            metrics[sym] = {
+                "ofi": round(ps.last_ofi, 4),
+                "obi": round(ot.obi, 4),
+                "vpin": round(ot.vpin, 4),
+                "toxicity": round(ot.toxicity, 4),
+                "arrival_intensity": round(ot.arrival_intensity, 2),
+                "volume_surge": round(ot.volume_surge, 2),
+                "institutional_flow": round(ot.institutional_flow, 3),
+                "depth_pressure": round(ot.depth_pressure, 4),
+                "spoof_score": round(ot.spoof_score, 3),
+                "regime": ps.regime.regime,
+                "vr": round(ps.regime.vr, 3),
+                "hurst": round(ps.regime.hurst, 3),
+                "spread_bps": round(ps.last_spread_bps, 1),
+                "atr": round(ps.last_atr, 6),
+                "position": round(ps.position, 2),
+            }
+    except (ImportError, Exception):
+        pass
+    return metrics
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/data":
@@ -271,6 +300,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(_get_stats())
         elif self.path == "/analytics":
             self._json(_get_analytics())
+        elif self.path == "/metrics":
+            self._json(_get_metrics())
         elif self.path == "/health":
             uptime_s = time.time() - _start_time
             self._json({"status": "ok", "uptime_s": int(uptime_s), "uptime_h": round(uptime_s / 3600, 1)})
