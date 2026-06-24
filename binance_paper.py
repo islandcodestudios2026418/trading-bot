@@ -85,6 +85,12 @@ class OFITracker:
     institutional_flow: float = 0.0  # 0-1 score, >0.5 = likely institutional
     # Depth pressure gradient
     depth_pressure: float = 0.0  # >0 = bid wall (support), <0 = ask wall (resistance)
+    # Quote stuffing/spoofing detection
+    _bid_changes: deque = field(default_factory=lambda: deque(maxlen=30))  # recent bid top changes
+    _ask_changes: deque = field(default_factory=lambda: deque(maxlen=30))
+    _last_bid_top: float = 0.0
+    _last_ask_top: float = 0.0
+    spoof_score: float = 0.0  # 0-1, >0.5 = likely spoofing detected
 
     def update(self, bid_vol: float, ask_vol: float) -> float:
         """Update with new depth snapshot. Returns weighted composite OFI."""
@@ -111,6 +117,28 @@ class OFITracker:
         if total_deep > 0:
             raw = (deep_bid - deep_ask) / total_deep
             self.depth_pressure += 0.1 * (raw - self.depth_pressure)  # smooth
+
+        # Spoofing detection: rapid top-of-book changes without execution
+        import time
+        now = time.time()
+        bid_top = float(bids[0][0])
+        ask_top = float(asks[0][0])
+        if self._last_bid_top > 0 and bid_top != self._last_bid_top:
+            self._bid_changes.append(now)
+        if self._last_ask_top > 0 and ask_top != self._last_ask_top:
+            self._ask_changes.append(now)
+        self._last_bid_top = bid_top
+        self._last_ask_top = ask_top
+
+        # Count changes in last 2 seconds — >10 changes = suspicious
+        cutoff = now - 2.0
+        bid_chg = sum(1 for t in self._bid_changes if t >= cutoff)
+        ask_chg = sum(1 for t in self._ask_changes if t >= cutoff)
+        max_chg = max(bid_chg, ask_chg)
+        if max_chg > 10:
+            self.spoof_score = min(1.0, self.spoof_score + 0.3)
+        else:
+            self.spoof_score *= 0.9  # decay
 
     def update_trade(self, qty_usd: float, is_buyer_maker: bool, ts_ms: float = 0):
         """Update trade flow from aggTrade stream + detect institutional splitting."""
@@ -201,6 +229,7 @@ class PairState:
     # Trailing stop
     _best_pnl: float = 0.0  # best unrealized PnL since entry
     _scaled_out: bool = False  # True after first partial take-profit
+    _entry_time: float = 0.0  # time.time() of position entry
     # Regime detection
     regime: RegimeDetector = field(default_factory=RegimeDetector)
 
@@ -493,6 +522,11 @@ async def run_pair(symbol: str):
                 elif dp < -0.2:  # strong ask wall resistance
                     sell_thresh *= 0.8
 
+                # Spoofing detection: if detected, increase threshold (less reliable book)
+                if ps.ofi_tracker.spoof_score > 0.5:
+                    buy_thresh *= 1.5
+                    sell_thresh *= 1.5
+
                 if ps.position == 0:
                     # Momentum confirmation: price ticks + aggTrade direction must align
                     tox_confirms_buy = tox > -0.1  # not actively selling
@@ -504,19 +538,31 @@ async def run_pair(symbol: str):
                         adj_size = size * spread_mult * sp["size_mult"]
                         ps.position = adj_size
                         ps.entry_price = best_ask
+                        ps._entry_time = time.time()
                         log(f"[{symbol}] BUY ${adj_size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
                     elif ps.last_ofi < sell_thresh and ps._momentum <= -mom_req and tox_confirms_sell:
                         spread_mult = min(2.0, max(0.5, ps.last_spread_bps / 5.0))
                         adj_size = size * spread_mult * sp["size_mult"]
                         ps.position = -adj_size
                         ps.entry_price = best_bid
+                        ps._entry_time = time.time()
                         log(f"[{symbol}] SELL ${adj_size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
 
                 elif ps.position > 0:
-                    # ATR-based trailing stop + OFI flip (regime-adaptive)
-                    spread = best_ask - best_bid
+                    # Position aging: force exit after 60s if not profitable
+                    age = time.time() - ps._entry_time if ps._entry_time > 0 else 0
                     pnl_per_unit = (best_bid - ps.entry_price)
                     unrealized = pnl_per_unit / ps.entry_price * ps.position
+                    if age > 60 and unrealized <= 0:
+                        _record(ps, unrealized)
+                        log(f"[{symbol}] AGE_EXIT_LONG ${unrealized:.4f} ({age:.0f}s held)")
+                        ps.position = 0
+                        ps._best_pnl = 0
+                        ps._scaled_out = False
+                        ps._entry_time = 0
+                        continue
+                    # ATR-based trailing stop + OFI flip (regime-adaptive)
+                    spread = best_ask - best_bid
                     ps._best_pnl = max(ps._best_pnl, unrealized)
                     atr_mult = ps.regime.adapt_exit(1.5)
                     trail_dist = atr * atr_mult if atr > 0 else spread * 2
@@ -556,10 +602,20 @@ async def run_pair(symbol: str):
                         ps._scaled_out = False
 
                 elif ps.position < 0:
-                    # ATR-based trailing stop + OFI flip (regime-adaptive)
-                    spread = best_ask - best_bid
+                    # Position aging: force exit after 60s if not profitable
+                    age = time.time() - ps._entry_time if ps._entry_time > 0 else 0
                     pnl_per_unit = (ps.entry_price - best_ask)
                     unrealized = pnl_per_unit / ps.entry_price * abs(ps.position)
+                    if age > 60 and unrealized <= 0:
+                        _record(ps, unrealized)
+                        log(f"[{symbol}] AGE_EXIT_SHORT ${unrealized:.4f} ({age:.0f}s held)")
+                        ps.position = 0
+                        ps._best_pnl = 0
+                        ps._scaled_out = False
+                        ps._entry_time = 0
+                        continue
+                    # ATR-based trailing stop + OFI flip (regime-adaptive)
+                    spread = best_ask - best_bid
                     ps._best_pnl = max(ps._best_pnl, unrealized)
                     atr_mult = ps.regime.adapt_exit(1.5)
                     trail_dist = atr * atr_mult if atr > 0 else spread * 2

@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone, timedelta
 
 import websockets
@@ -39,6 +40,9 @@ _okx_mids: dict[str, float] = {}
 _last_trade: dict[str, float] = {}
 _pnl = 0.0
 _trades = 0
+# Adaptive trigger: track recent divergence history
+_div_history: dict[str, deque] = {}  # symbol → recent abs(div_bps)
+_binance_depth: dict[str, tuple] = {}  # symbol → (bid_depth_usd, ask_depth_usd) at top 5
 
 
 def _symbol_to_okx(sym: str) -> str:
@@ -72,7 +76,7 @@ def _execute_on_okx(inst_id: str, side: str, mid: float, div_bps: float) -> bool
 
 
 def _check_divergence(symbol: str):
-    """Check if Binance-OKX divergence exceeds threshold."""
+    """Check if Binance-OKX divergence exceeds adaptive threshold."""
     global _pnl, _trades
 
     b_mid = _binance_mids.get(symbol, 0)
@@ -85,19 +89,42 @@ def _check_divergence(symbol: str):
         return
 
     div_bps = (b_mid - o_mid) / o_mid * 10000
-    if abs(div_bps) < TRIGGER_BPS:
+
+    # Track divergence history for adaptive trigger
+    if symbol not in _div_history:
+        _div_history[symbol] = deque(maxlen=500)
+    _div_history[symbol].append(abs(div_bps))
+
+    # Adaptive trigger: 1.5x recent average divergence, minimum TRIGGER_BPS
+    hist = _div_history[symbol]
+    if len(hist) >= 50:
+        avg_div = sum(hist) / len(hist)
+        adaptive_trigger = max(TRIGGER_BPS, avg_div * 1.5)
+    else:
+        adaptive_trigger = TRIGGER_BPS
+
+    if abs(div_bps) < adaptive_trigger:
         return
 
+    # Depth-aware sizing: don't trade more than 30% of available depth
+    depth = _binance_depth.get(symbol, (0, 0))
     side = "buy" if div_bps > 0 else "sell"
+    available_depth = depth[0] if side == "buy" else depth[1]  # bid/ask depth on OKX side
+    if available_depth > 0:
+        max_size = available_depth * 0.3
+        trade_size = min(SIZE_USD, max_size)
+    else:
+        trade_size = SIZE_USD
+
     ok = _execute_on_okx(okx_inst, side, o_mid, div_bps)
 
-    est_profit = SIZE_USD * abs(div_bps) / 10000 * 0.5
+    est_profit = trade_size * abs(div_bps) / 10000 * 0.5
     _pnl += est_profit
     _trades += 1
     _last_trade[symbol] = time.time()
     record_trade(est_profit, source="cross")
     mode = "" if ok else "(paper) "
-    log(f"[CROSS-ARB] {symbol} {side.upper()} {mode}| div={div_bps:+.1f}bps | est=${est_profit:.4f} | total=${_pnl:.4f}")
+    log(f"[CROSS-ARB] {symbol} {side.upper()} {mode}| div={div_bps:+.1f}bps (trigger={adaptive_trigger:.1f}) | sz=${trade_size:.0f} | est=${est_profit:.4f} | total=${_pnl:.4f}")
 
 
 async def _stream_okx():
@@ -142,6 +169,10 @@ async def _stream_binance():
                     continue
                 mid = (float(bids[0][0]) + float(asks[0][0])) / 2
                 _binance_mids[symbol] = mid
+                # Track depth for sizing
+                bid_depth = sum(float(b[0]) * float(b[1]) for b in bids)
+                ask_depth = sum(float(a[0]) * float(a[1]) for a in asks)
+                _binance_depth[symbol] = (bid_depth, ask_depth)
                 _check_divergence(symbol)
         except websockets.ConnectionClosed:
             log("[CROSS-ARB] Binance WS reconnecting...")
