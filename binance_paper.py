@@ -121,6 +121,9 @@ class OFITracker:
     _vol_ema: float = 0.0  # 30s EMA of volume per tick
     _vol_alpha: float = 1 - 0.97  # ~30 tick half-life at 1 trade/sec
     volume_surge: float = 1.0  # current_vol / ema_vol, >3.0 = surge
+    # Trade arrival rate: Poisson deviation detector
+    _trade_times: deque = field(default_factory=lambda: deque(maxlen=100))  # recent trade timestamps (ms)
+    arrival_intensity: float = 1.0  # current_rate / baseline_rate, >2.0 = informed surge
     # Order book imbalance (OBI): shallow levels 1-5
     obi: float = 0.0  # [-1,+1]: +1 = all bids, useful as alpha confirmation
     # Depth pressure gradient
@@ -183,6 +186,19 @@ class OFITracker:
 
     def update_trade(self, qty_usd: float, is_buyer_maker: bool, ts_ms: float = 0):
         """Update trade flow from aggTrade stream + detect institutional splitting + VPIN."""
+        # Trade arrival rate: compare recent inter-arrival time to baseline
+        import time as _time
+        now_ms = ts_ms or _time.time() * 1000
+        self._trade_times.append(now_ms)
+        if len(self._trade_times) >= 10:
+            # Recent rate: last 10 trades
+            recent_span = (self._trade_times[-1] - self._trade_times[-10]) / 1000  # seconds
+            recent_rate = 10 / max(0.01, recent_span)  # trades/sec
+            # Baseline: full window
+            full_span = (self._trade_times[-1] - self._trade_times[0]) / 1000
+            baseline_rate = len(self._trade_times) / max(0.01, full_span)
+            self.arrival_intensity = recent_rate / max(0.01, baseline_rate)
+
         # Volume surge detection: compare current vol to EMA
         if self._vol_ema > 0:
             self.volume_surge = qty_usd / self._vol_ema
@@ -630,6 +646,13 @@ async def run_pair(symbol: str):
                         buy_thresh *= 0.5  # surge + bullish OFI = strong buy signal
                     elif ps.last_ofi < -0.1:
                         sell_thresh *= 0.5  # surge + bearish OFI = strong sell signal
+
+                # Trade arrival rate: 2x+ baseline = informed surge, tighten with direction
+                if ps.ofi_tracker.arrival_intensity > 2.0:
+                    if tox > 0.2:
+                        buy_thresh *= 0.7  # fast buying = momentum entry
+                    elif tox < -0.2:
+                        sell_thresh *= 0.7  # fast selling = momentum entry
 
                 if ps.position == 0:
                     # Momentum confirmation: price ticks + aggTrade direction must align

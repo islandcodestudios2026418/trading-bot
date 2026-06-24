@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone, timedelta
 
 import websockets
@@ -57,6 +58,37 @@ class OKXWSMarketMaker:
         # Fill-rate adaptive spread: track how fast quotes get filled
         self._fill_rate: dict[str, float] = {}  # instId → fill_rate (0-1)
         self._edge_mult: dict[str, float] = {}  # instId → edge multiplier (0.5-3.0)
+        # Dynamic spread: volatility tracker per pair
+        self._mid_history: dict[str, deque] = {}  # instId → last 100 mids
+        self._realized_vol: dict[str, float] = {}  # instId → realized vol (bps/tick)
+
+    def _update_vol(self, inst_id: str, mid: float):
+        """Track realized volatility for dynamic spread calculation."""
+        if inst_id not in self._mid_history:
+            self._mid_history[inst_id] = deque(maxlen=100)
+        hist = self._mid_history[inst_id]
+        if hist and hist[-1] > 0:
+            ret = abs(mid - hist[-1]) / hist[-1] * 10000  # bps
+            alpha = 0.05
+            prev_vol = self._realized_vol.get(inst_id, ret)
+            self._realized_vol[inst_id] = prev_vol + alpha * (ret - prev_vol)
+        hist.append(mid)
+
+    def _dynamic_edge(self, inst_id: str) -> float:
+        """Calculate dynamic edge (bps) based on volatility + inventory risk.
+        Higher vol → wider spread. Inventory skew → asymmetric quotes."""
+        base = EDGE_BPS
+        # Vol adjustment: scale edge with realized vol (1x at 5bps vol, 2x at 10bps)
+        vol = self._realized_vol.get(inst_id, 5.0)
+        vol_mult = max(0.5, min(3.0, vol / 5.0))
+        # Inventory risk: penalize concentrated positions
+        inv = self._inv.get(inst_id, {"qty": 0})
+        mid = self._books.get(inst_id, {}).get("mid", 1)
+        inv_usd = abs(inv.get("qty", 0)) * mid
+        inv_mult = 1.0 + (inv_usd / 100) * 0.5  # +50% per $100 inventory
+        # Fill-rate adjustment (existing)
+        fill_mult = self._edge_mult.get(inst_id, 1.0)
+        return base * vol_mult * min(2.0, inv_mult) * fill_mult
 
     def _scan_pairs(self):
         """Find widest-spread pairs via REST (periodic, infrequent)."""
@@ -72,10 +104,12 @@ class OKXWSMarketMaker:
         book = self._books.get(inst_id)
         if not book:
             return False
+        mid = book["mid"]
+        self._update_vol(inst_id, mid)
         last_mid = self._last_quote_mid.get(inst_id, 0)
         if last_mid == 0:
             return True
-        move = abs(book["mid"] - last_mid) / last_mid * 10000
+        move = abs(mid - last_mid) / last_mid * 10000
         return move >= REQUOTE_BPS
 
     def _quote_pair(self, inst_id: str) -> bool:
@@ -93,9 +127,11 @@ class OKXWSMarketMaker:
         if spread_bps < MIN_SPREAD_BPS:
             return False
 
-        # Tighten by adaptive EDGE_BPS (adjusted by fill rate)
-        edge_mult = self._edge_mult.get(inst_id, 1.0)
-        effective_edge = EDGE_BPS * edge_mult
+        # Update volatility tracker
+        self._update_vol(inst_id, mid)
+
+        # Dynamic edge: volatility + inventory risk + fill-rate adaptive
+        effective_edge = self._dynamic_edge(inst_id)
         edge = mid * effective_edge / 10000
         our_bid = book["bid"] + edge
         our_ask = book["ask"] - edge
