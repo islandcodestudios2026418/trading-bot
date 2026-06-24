@@ -59,6 +59,9 @@ class OFITracker:
     _sell_vol: float = 0.0
     _flow_alpha: float = 1 - 0.99  # ~100 trade half-life
     toxicity: float = 0.0  # [-1, +1]: +1 = all buys, -1 = all sells
+    # Institutional flow detection (iceberg/order splitting)
+    _recent_trades: deque = field(default_factory=lambda: deque(maxlen=50))
+    institutional_flow: float = 0.0  # 0-1 score, >0.5 = likely institutional
 
     def update(self, bid_vol: float, ask_vol: float) -> float:
         """Update with new depth snapshot. Returns weighted composite OFI."""
@@ -69,14 +72,40 @@ class OFITracker:
         self.ofi_30s += self._alpha_30s * (raw_ofi - self.ofi_30s)
         return self.w1 * self.ofi_1s + self.w5 * self.ofi_5s + self.w30 * self.ofi_30s
 
-    def update_trade(self, qty_usd: float, is_buyer_maker: bool):
-        """Update trade flow from aggTrade stream."""
+    def update_trade(self, qty_usd: float, is_buyer_maker: bool, ts_ms: float = 0):
+        """Update trade flow from aggTrade stream + detect institutional splitting."""
         if is_buyer_maker:
             self._sell_vol += self._flow_alpha * (qty_usd - self._sell_vol)
         else:
             self._buy_vol += self._flow_alpha * (qty_usd - self._buy_vol)
         total = self._buy_vol + self._sell_vol
         self.toxicity = (self._buy_vol - self._sell_vol) / total if total > 0 else 0
+
+        # Institutional detection: many similar-sized trades in short window
+        import time
+        now = ts_ms or time.time() * 1000
+        self._recent_trades.append((now, qty_usd, is_buyer_maker))
+        # Look at last 500ms window
+        cutoff = now - 500
+        window = [(t, q, s) for t, q, s in self._recent_trades if t >= cutoff]
+        if len(window) >= 5:
+            # Check if trades are similar size (CV < 0.3) and same direction
+            sizes = [q for _, q, _ in window]
+            directions = [s for _, _, s in window]
+            mean_sz = sum(sizes) / len(sizes)
+            if mean_sz > 0:
+                std_sz = (sum((s - mean_sz) ** 2 for s in sizes) / len(sizes)) ** 0.5
+                cv = std_sz / mean_sz
+                same_dir = sum(1 for d in directions if d == directions[0]) / len(directions)
+                # Low CV (similar sizes) + same direction = institutional
+                if cv < 0.3 and same_dir > 0.8:
+                    self.institutional_flow = min(1.0, self.institutional_flow + 0.2)
+                else:
+                    self.institutional_flow *= 0.95
+            else:
+                self.institutional_flow *= 0.95
+        else:
+            self.institutional_flow *= 0.98
 
     def dominant_tf(self) -> int:
         vals = [abs(self.ofi_1s), abs(self.ofi_5s), abs(self.ofi_30s)]
@@ -385,15 +414,35 @@ async def run_pair(symbol: str):
                 elif tox < -0.3:  # sellers aggressive — easier to go short
                     sell_thresh *= 0.8
 
+                # Institutional flow: if detected, strongly weight OFI in that direction
+                inst_flow = ps.ofi_tracker.institutional_flow
+                if inst_flow > 0.5:
+                    if tox > 0:
+                        buy_thresh *= 0.5  # institutional buying → much easier long entry
+                    elif tox < 0:
+                        sell_thresh *= 0.5  # institutional selling → much easier short entry
+
+                # Spread-adaptive: no edge if spread is too tight
+                if ps.last_spread_bps < 1.0:
+                    continue  # sub-1bp spread = no edge, skip tick
+
                 if ps.position == 0:
-                    if ps.last_ofi > buy_thresh and ps._momentum >= 3:
-                        ps.position = size
+                    # Momentum confirmation: price ticks + aggTrade direction must align
+                    tox_confirms_buy = tox > -0.1  # not actively selling
+                    tox_confirms_sell = tox < 0.1  # not actively buying
+                    if ps.last_ofi > buy_thresh and ps._momentum >= 3 and tox_confirms_buy:
+                        # Scale size by spread width (wider spread = more edge = bigger size)
+                        spread_mult = min(2.0, max(0.5, ps.last_spread_bps / 5.0))
+                        adj_size = size * spread_mult
+                        ps.position = adj_size
                         ps.entry_price = best_ask
-                        log(f"[{symbol}] BUY ${size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f} mom={ps._momentum}")
-                    elif ps.last_ofi < sell_thresh and ps._momentum <= -3:
-                        ps.position = -size
+                        log(f"[{symbol}] BUY ${adj_size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
+                    elif ps.last_ofi < sell_thresh and ps._momentum <= -3 and tox_confirms_sell:
+                        spread_mult = min(2.0, max(0.5, ps.last_spread_bps / 5.0))
+                        adj_size = size * spread_mult
+                        ps.position = -adj_size
                         ps.entry_price = best_bid
-                        log(f"[{symbol}] SELL ${size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f} mom={ps._momentum}")
+                        log(f"[{symbol}] SELL ${adj_size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
 
                 elif ps.position > 0:
                     # ATR-based trailing stop + OFI flip (regime-adaptive)
@@ -478,7 +527,7 @@ async def _aggtrade_stream():
                 px = float(data.get("p", 0))
                 qty = float(data.get("q", 0))
                 is_buyer_maker = data.get("m", False)
-                ps.ofi_tracker.update_trade(px * qty, is_buyer_maker)
+                ps.ofi_tracker.update_trade(px * qty, is_buyer_maker, float(data.get("T", 0)))
         except websockets.ConnectionClosed:
             await asyncio.sleep(2)
 
