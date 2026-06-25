@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 import websockets
 
 from regime import RegimeDetector
+from ws_manager import register as ws_register
 
 try:
     from signal_attrib import attrib
@@ -526,6 +527,14 @@ def _record(ps: PairState, profit: float):
             log(f"{ps.symbol} paused {PAUSE_SECONDS}s after {CONSEC_LOSS_PAUSE} consecutive losses")
             alert_trade(ps.symbol, "PAUSED", net_profit, daily_pnl)
     record_trade(net_profit)
+    # Capital allocation tracking
+    try:
+        from capital_alloc import allocator
+        if "binance_mm" not in allocator.strategies:
+            allocator.register("binance_mm")
+        allocator.strategies["binance_mm"].record(net_profit)
+    except (ImportError, Exception):
+        pass
     # Periodic stats persistence (every 100 fills)
     if daily_fills % 100 == 0:
         _save_stats()
@@ -539,11 +548,16 @@ async def run_pair(symbol: str):
     ps = PairState(symbol=symbol)
     pair_states[symbol] = ps
     url = f"wss://data-stream.binance.vision/ws/{symbol.lower()}@depth20@100ms"
+    ws_state = ws_register(f"binance-depth-{symbol}")
     log(f"[{symbol}] Connecting depth20 stream...")
 
-    async for ws in websockets.connect(url, ssl=True):
+    while True:
         try:
-            async for raw in ws:
+            async with websockets.connect(url, ssl=True) as ws:
+                ws_state.on_connect()
+                log(f"[{symbol}] WS connected (reconnects={ws_state.reconnects})")
+                async for raw in ws:
+                    ws_state.on_message()
                 if _halt_check():
                     await asyncio.sleep(60)
                     continue
@@ -902,30 +916,39 @@ async def run_pair(symbol: str):
                         ps._highest_mid = mid
                         ps._lowest_mid = 999999
 
-        except websockets.ConnectionClosed:
-            log(f"[{symbol}] Reconnecting...")
-            await asyncio.sleep(2)
+        except (websockets.ConnectionClosed, OSError, Exception) as e:
+            ws_state.on_disconnect()
+            delay = ws_state.next_backoff()
+            log(f"[{symbol}] WS disconnected: {e} — reconnecting in {delay:.0f}s")
+            await asyncio.sleep(delay)
 
 
 async def _aggtrade_stream():
     """Stream aggTrades for all symbols to track trade flow toxicity."""
     streams = "/".join(f"{s.lower()}@aggTrade" for s in SYMBOLS)
     url = f"wss://data-stream.binance.vision/stream?streams={streams}"
-    async for ws in websockets.connect(url, ssl=True):
+    ws_state = ws_register("binance-aggtrade")
+    while True:
         try:
-            async for raw in ws:
-                msg = json.loads(raw)
-                data = msg.get("data", {})
-                symbol = data.get("s", "")
-                ps = pair_states.get(symbol)
-                if not ps:
-                    continue
-                px = float(data.get("p", 0))
-                qty = float(data.get("q", 0))
-                is_buyer_maker = data.get("m", False)
-                ps.ofi_tracker.update_trade(px * qty, is_buyer_maker, float(data.get("T", 0)))
-        except websockets.ConnectionClosed:
-            await asyncio.sleep(2)
+            async with websockets.connect(url, ssl=True) as ws:
+                ws_state.on_connect()
+                async for raw in ws:
+                    ws_state.on_message()
+                    msg = json.loads(raw)
+                    data = msg.get("data", {})
+                    symbol = data.get("s", "")
+                    ps = pair_states.get(symbol)
+                    if not ps:
+                        continue
+                    px = float(data.get("p", 0))
+                    qty = float(data.get("q", 0))
+                    is_buyer_maker = data.get("m", False)
+                    ps.ofi_tracker.update_trade(px * qty, is_buyer_maker, float(data.get("T", 0)))
+        except (websockets.ConnectionClosed, OSError, Exception) as e:
+            ws_state.on_disconnect()
+            delay = ws_state.next_backoff()
+            log(f"[aggTrade] WS disconnected: {e} — reconnecting in {delay:.0f}s")
+            await asyncio.sleep(delay)
 
 
 async def run():

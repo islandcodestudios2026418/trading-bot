@@ -298,6 +298,24 @@ def _get_metrics() -> dict:
         metrics["_disabled_signals"] = list(attrib.disabled_signals)
     except (ImportError, Exception):
         pass
+    # WS connection health
+    try:
+        from ws_manager import all_status, any_stale
+        metrics["_ws"] = {"connections": all_status(), "stale": any_stale()}
+    except (ImportError, Exception):
+        pass
+    # OKX execution latency
+    try:
+        from okx_mm import _exec_metrics
+        metrics["_okx_exec"] = _exec_metrics()
+    except (ImportError, Exception):
+        pass
+    # Capital allocation
+    try:
+        from capital_alloc import allocator
+        metrics["_capital_alloc"] = allocator.status()
+    except (ImportError, Exception):
+        pass
     return metrics
 
 
@@ -314,6 +332,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/health":
             uptime_s = time.time() - _start_time
             self._json({"status": "ok", "uptime_s": int(uptime_s), "uptime_h": round(uptime_s / 3600, 1)})
+        elif self.path == "/ws":
+            try:
+                from ws_manager import all_status, any_stale
+                self._json({"connections": all_status(), "stale": any_stale()})
+            except Exception:
+                self._json({"connections": [], "stale": []})
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html")

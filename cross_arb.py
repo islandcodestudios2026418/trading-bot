@@ -13,6 +13,8 @@ from datetime import datetime, timezone, timedelta
 import websockets
 import requests
 
+from ws_manager import register as ws_register
+
 TW_TZ = timezone(timedelta(hours=8))
 
 # Config
@@ -142,6 +144,14 @@ def _check_divergence(symbol: str):
     _trades += 1
     _last_trade[symbol] = time.time()
     record_trade(est_profit, source="cross")
+    # Capital allocation tracking
+    try:
+        from capital_alloc import allocator
+        if "cross_arb" not in allocator.strategies:
+            allocator.register("cross_arb")
+        allocator.strategies["cross_arb"].record(est_profit)
+    except (ImportError, Exception):
+        pass
     mode = "" if ok else "(paper) "
     log(f"[CROSS-ARB] {symbol} {side.upper()} {mode}| z={z_score:+.2f} div={div_bps:+.1f}bps | sz=${trade_size:.0f} | est=${est_profit:.4f} | total=${_pnl:.4f}")
 
@@ -149,12 +159,15 @@ def _check_divergence(symbol: str):
 async def _stream_okx():
     """Stream OKX tickers via WebSocket."""
     okx_insts = [{"channel": "tickers", "instId": _symbol_to_okx(s)} for s in PAIRS]
+    ws_state = ws_register("cross-arb-okx")
     while True:
         try:
             async with websockets.connect(OKX_WS_PUBLIC, ssl=True) as ws:
                 await ws.send(json.dumps({"op": "subscribe", "args": okx_insts}))
+                ws_state.on_connect()
                 log(f"[CROSS-ARB] OKX WS connected: {[_symbol_to_okx(s) for s in PAIRS]}")
                 async for raw in ws:
+                    ws_state.on_message()
                     msg = json.loads(raw)
                     data = msg.get("data", [{}])
                     if not data:
@@ -166,36 +179,44 @@ async def _stream_okx():
                         if bid > 0 and ask > 0:
                             _okx_mids[inst] = (bid + ask) / 2
         except Exception as e:
-            log(f"[CROSS-ARB] OKX WS error: {e}, reconnecting...")
-            await asyncio.sleep(3)
+            ws_state.on_disconnect()
+            delay = ws_state.next_backoff()
+            log(f"[CROSS-ARB] OKX WS error: {e}, reconnecting in {delay:.0f}s...")
+            await asyncio.sleep(delay)
 
 
 async def _stream_binance():
     """Stream Binance depth and check divergence on each tick."""
     streams = "/".join(f"{s.lower()}@depth5@100ms" for s in PAIRS)
     url = f"wss://data-stream.binance.vision/stream?streams={streams}"
+    ws_state = ws_register("cross-arb-binance")
 
-    async for ws in websockets.connect(url, ssl=True):
+    while True:
         try:
-            async for raw in ws:
-                msg = json.loads(raw)
-                data = msg.get("data", {})
-                stream = msg.get("stream", "")
-                symbol = stream.split("@")[0].upper()
-                bids = data.get("bids", [])
-                asks = data.get("asks", [])
-                if not bids or not asks:
-                    continue
-                mid = (float(bids[0][0]) + float(asks[0][0])) / 2
-                _binance_mids[symbol] = mid
-                # Track depth for sizing
-                bid_depth = sum(float(b[0]) * float(b[1]) for b in bids)
-                ask_depth = sum(float(a[0]) * float(a[1]) for a in asks)
-                _binance_depth[symbol] = (bid_depth, ask_depth)
-                _check_divergence(symbol)
-        except websockets.ConnectionClosed:
-            log("[CROSS-ARB] Binance WS reconnecting...")
-            await asyncio.sleep(2)
+            async with websockets.connect(url, ssl=True) as ws:
+                ws_state.on_connect()
+                async for raw in ws:
+                    ws_state.on_message()
+                    msg = json.loads(raw)
+                    data = msg.get("data", {})
+                    stream = msg.get("stream", "")
+                    symbol = stream.split("@")[0].upper()
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    if not bids or not asks:
+                        continue
+                    mid = (float(bids[0][0]) + float(asks[0][0])) / 2
+                    _binance_mids[symbol] = mid
+                    # Track depth for sizing
+                    bid_depth = sum(float(b[0]) * float(b[1]) for b in bids)
+                    ask_depth = sum(float(a[0]) * float(a[1]) for a in asks)
+                    _binance_depth[symbol] = (bid_depth, ask_depth)
+                    _check_divergence(symbol)
+        except (websockets.ConnectionClosed, OSError, Exception) as e:
+            ws_state.on_disconnect()
+            delay = ws_state.next_backoff()
+            log(f"[CROSS-ARB] Binance WS error: {e}, reconnecting in {delay:.0f}s...")
+            await asyncio.sleep(delay)
 
 
 async def run():

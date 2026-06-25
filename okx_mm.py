@@ -18,6 +18,7 @@ from okx_client import (
     get_balance, _sign, _ts, API_KEY, SECRET, PASSPHRASE, SIMULATED
 )
 from risk_manager import RiskManager
+from ws_manager import register as ws_register
 
 TW_TZ = timezone(timedelta(hours=8))
 
@@ -62,6 +63,8 @@ class OKXWSMarketMaker:
         # Dynamic spread: volatility tracker per pair
         self._mid_history: dict[str, deque] = {}  # instId → last 100 mids
         self._realized_vol: dict[str, float] = {}  # instId → realized vol (bps/tick)
+        # Maker/taker fill tracking for rebate optimization
+        self._maker_stats: dict[str, dict] = {}  # instId → {maker, taker, rebates}
 
     def _update_vol(self, inst_id: str, mid: float):
         """Track realized volatility for dynamic spread calculation."""
@@ -104,6 +107,9 @@ class OKXWSMarketMaker:
         """Requote if mid moved more than REQUOTE_BPS from last quote."""
         book = self._books.get(inst_id)
         if not book:
+            return False
+        # Staleness check: skip if book data is >10s old
+        if time.time() - book.get("ts", 0) > 10:
             return False
         mid = book["mid"]
         self._update_vol(inst_id, mid)
@@ -229,9 +235,21 @@ class OKXWSMarketMaker:
         fill_px = float(data.get("fillPx") or data.get("avgPx") or "0")
         fill_sz = float(data.get("fillSz") or data.get("accFillSz") or "0")
         fee = float(data.get("fee") or "0")
+        exec_type = data.get("execType", "")  # M=maker, T=taker
 
         if not inst or fill_px <= 0:
             return
+
+        # Maker/taker tracking for rebate optimization
+        is_maker = exec_type == "M" or fee <= 0  # negative fee = rebate = maker
+        if inst not in self._maker_stats:
+            self._maker_stats[inst] = {"maker": 0, "taker": 0, "rebates": 0.0}
+        ms = self._maker_stats[inst]
+        if is_maker:
+            ms["maker"] += 1
+            ms["rebates"] += abs(fee)  # rebate earned
+        else:
+            ms["taker"] += 1
 
         # Fill-rate adaptive spread: track time between quote and fill
         quote_time = self._last_quote_time.get(inst, 0)
@@ -263,6 +281,14 @@ class OKXWSMarketMaker:
             self.fills_count += 1
             self.rm.record_trade(pnl)
             record_trade(pnl, source="okx")
+            # Capital allocation tracking
+            try:
+                from capital_alloc import allocator
+                if "okx_mm" not in allocator.strategies:
+                    allocator.register("okx_mm")
+                allocator.strategies["okx_mm"].record(pnl)
+            except (ImportError, Exception):
+                pass
             log(f"[OKX-MM] RT {inst}: entry={avg_entry:.4f} exit={fill_px:.4f} pnl=${pnl:.4f} total=${self.pnl:.4f}")
         else:
             inv["cost"] -= fill_px * fill_sz
@@ -271,6 +297,7 @@ class OKXWSMarketMaker:
 
     async def _ws_orderbook(self):
         """Subscribe to real-time orderbook for active pairs."""
+        ws_state = ws_register("okx-orderbook")
         while True:
             if not self.active_pairs:
                 await asyncio.sleep(5)
@@ -279,8 +306,10 @@ class OKXWSMarketMaker:
             try:
                 async with websockets.connect(OKX_WS_PUBLIC, ssl=True) as ws:
                     await ws.send(json.dumps({"op": "subscribe", "args": args}))
+                    ws_state.on_connect()
                     log(f"[OKX-MM] WS orderbook connected: {self.active_pairs}")
                     async for raw in ws:
+                        ws_state.on_message()
                         msg = json.loads(raw)
                         data = msg.get("data", [])
                         if not data:
@@ -292,15 +321,18 @@ class OKXWSMarketMaker:
                         if bids and asks:
                             bid = float(bids[0][0])
                             ask = float(asks[0][0])
-                            self._books[inst] = {"bid": bid, "ask": ask, "mid": (bid + ask) / 2}
+                            self._books[inst] = {"bid": bid, "ask": ask, "mid": (bid + ask) / 2, "ts": time.time()}
             except Exception as e:
-                log(f"[OKX-MM] WS book error: {e}, reconnecting...")
-                await asyncio.sleep(3)
+                ws_state.on_disconnect()
+                delay = ws_state.next_backoff()
+                log(f"[OKX-MM] WS book error: {e}, reconnecting in {delay:.0f}s...")
+                await asyncio.sleep(delay)
 
     async def _ws_private(self):
         """Subscribe to private orders channel for instant fill detection."""
         if not API_KEY:
             return
+        ws_state = ws_register("okx-private")
         while True:
             try:
                 async with websockets.connect(OKX_WS_PRIVATE, ssl=True) as ws:
@@ -325,15 +357,19 @@ class OKXWSMarketMaker:
                     # Subscribe to orders
                     sub = {"op": "subscribe", "args": [{"channel": "orders", "instType": "SPOT"}]}
                     await ws.send(json.dumps(sub))
+                    ws_state.on_connect()
                     log("[OKX-MM] WS private connected (fills channel)")
 
                     async for raw in ws:
+                        ws_state.on_message()
                         msg = json.loads(raw)
                         for d in msg.get("data", []):
                             self._process_fill(d)
             except Exception as e:
-                log(f"[OKX-MM] WS private error: {e}, reconnecting...")
-                await asyncio.sleep(5)
+                ws_state.on_disconnect()
+                delay = ws_state.next_backoff()
+                log(f"[OKX-MM] WS private error: {e}, reconnecting in {delay:.0f}s...")
+                await asyncio.sleep(delay)
 
     async def _requote_loop(self):
         """Check if any pair needs requoting based on mid movement."""
@@ -383,9 +419,34 @@ class OKXWSMarketMaker:
             await asyncio.sleep(300)  # check every 5 min
 
 
+_mm_instance: "OKXWSMarketMaker | None" = None
+
+
+def _exec_metrics() -> dict:
+    """Expose execution quality metrics for /metrics endpoint."""
+    mm = _mm_instance
+    if not mm:
+        return {}
+    maker_rate = {}
+    for inst, ms in mm._maker_stats.items():
+        total = ms["maker"] + ms["taker"]
+        maker_rate[inst] = {"rate": round(ms["maker"] / total, 2) if total else 0, "rebates": round(ms["rebates"], 4)}
+    return {
+        "pnl": round(mm.pnl, 4),
+        "fills": mm.fills_count,
+        "edge_multipliers": {k: round(v, 2) for k, v in mm._edge_mult.items()},
+        "realized_vol_bps": {k: round(v, 1) for k, v in mm._realized_vol.items()},
+        "inventory": {k: {"qty": round(v["qty"], 6), "usd": round(v["qty"] * mm._books.get(k, {}).get("mid", 0), 2)} for k, v in mm._inv.items()},
+        "active_orders": len(mm._orders),
+        "maker_stats": maker_rate,
+    }
+
+
 async def run():
     """Main OKX MM — WebSocket-based."""
+    global _mm_instance
     mm = OKXWSMarketMaker()
+    _mm_instance = mm
     log("[OKX-MM] Starting WebSocket-based Market Maker v2...")
 
     if not os.getenv("OKX_API_KEY"):
