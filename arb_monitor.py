@@ -288,6 +288,7 @@ def _get_metrics() -> dict:
                 "spread_bps": round(ps.last_spread_bps, 1),
                 "atr": round(ps.last_atr, 6),
                 "position": round(ps.position, 2),
+                "predictor": ps.predictor.status(),
             }
     except (ImportError, Exception):
         pass
@@ -338,6 +339,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"connections": all_status(), "stale": any_stale()})
             except Exception:
                 self._json({"connections": [], "stale": []})
+        elif self.path == "/pnl":
+            try:
+                from pnl_store import get_summary
+                self._json(get_summary())
+            except Exception:
+                self._json({})
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html")

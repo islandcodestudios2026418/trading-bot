@@ -32,7 +32,7 @@ async def supervised(name: str, coro_fn):
 
 
 async def health_monitor():
-    """Periodic health check log."""
+    """Periodic health check + degraded condition alerting."""
     while True:
         await asyncio.sleep(HEALTH_INTERVAL)
         uptime = (time.time() - _start_time) / 3600
@@ -42,6 +42,26 @@ async def health_monitor():
             log(f"💓 Health: up {uptime:.1f}h | MM fills={daily_fills} pnl=${daily_pnl:.4f} | pairs_active={pairs_active}")
         except Exception:
             log(f"💓 Health: up {uptime:.1f}h")
+
+        # Alert on stale WS connections
+        try:
+            from ws_manager import any_stale
+            stale = any_stale()
+            if stale:
+                tg_send(f"⚠️ Stale WS: {', '.join(stale)} (>30s no data)")
+        except Exception:
+            pass
+
+        # Alert on circuit breaker
+        try:
+            from risk_manager import RiskManager
+            rm = RiskManager()
+            # Check from OKX MM instance
+            from okx_mm import _mm_instance
+            if _mm_instance and _mm_instance.rm.circuit_breaker.tripped:
+                tg_send(f"🔴 Circuit breaker TRIPPED: {_mm_instance.rm.circuit_breaker.trip_reason}")
+        except Exception:
+            pass
 
 
 async def main():
@@ -82,6 +102,12 @@ async def main():
             from binance_paper import _save_stats
             _save_stats()
             log("💾 Stats saved on shutdown")
+        except Exception:
+            pass
+        try:
+            from pnl_store import save as pnl_save
+            pnl_save()
+            log("💾 PnL history saved on shutdown")
         except Exception:
             pass
         done.cancel()

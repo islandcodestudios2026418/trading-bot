@@ -152,6 +152,12 @@ def _check_divergence(symbol: str):
         allocator.strategies["cross_arb"].record(est_profit)
     except (ImportError, Exception):
         pass
+    # PnL persistence
+    try:
+        from pnl_store import record as pnl_record
+        pnl_record("cross_arb", est_profit)
+    except (ImportError, Exception):
+        pass
     mode = "" if ok else "(paper) "
     log(f"[CROSS-ARB] {symbol} {side.upper()} {mode}| z={z_score:+.2f} div={div_bps:+.1f}bps | sz=${trade_size:.0f} | est=${est_profit:.4f} | total=${_pnl:.4f}")
 

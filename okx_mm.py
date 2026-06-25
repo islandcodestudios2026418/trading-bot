@@ -289,6 +289,12 @@ class OKXWSMarketMaker:
                 allocator.strategies["okx_mm"].record(pnl)
             except (ImportError, Exception):
                 pass
+            # PnL persistence
+            try:
+                from pnl_store import record as pnl_record
+                pnl_record("okx_mm", pnl)
+            except (ImportError, Exception):
+                pass
             log(f"[OKX-MM] RT {inst}: entry={avg_entry:.4f} exit={fill_px:.4f} pnl=${pnl:.4f} total=${self.pnl:.4f}")
         else:
             inv["cost"] -= fill_px * fill_sz

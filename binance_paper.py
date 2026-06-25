@@ -13,6 +13,7 @@ import websockets
 
 from regime import RegimeDetector
 from ws_manager import register as ws_register
+from flow_predict import FlowPredictor
 
 try:
     from signal_attrib import attrib
@@ -382,6 +383,8 @@ class PairState:
     _entry_signals: dict = field(default_factory=dict)  # signal attribution snapshot
     # Regime detection
     regime: RegimeDetector = field(default_factory=RegimeDetector)
+    # Flow prediction model (5-tick lookahead)
+    predictor: FlowPredictor = field(default_factory=FlowPredictor)
 
     @property
     def wr(self):
@@ -535,6 +538,12 @@ def _record(ps: PairState, profit: float):
         allocator.strategies["binance_mm"].record(net_profit)
     except (ImportError, Exception):
         pass
+    # Centralized PnL persistence
+    try:
+        from pnl_store import record as pnl_record
+        pnl_record("binance_mm", net_profit)
+    except (ImportError, Exception):
+        pass
     # Periodic stats persistence (every 100 fills)
     if daily_fills % 100 == 0:
         _save_stats()
@@ -604,6 +613,16 @@ async def run_pair(symbol: str):
                 ask_vol = sum(float(a[1]) * float(a[0]) * (0.85 ** i) for i, a in enumerate(asks))
                 ps.last_ofi = ps.ofi_tracker.update(bid_vol, ask_vol)
                 ps.ofi_tracker.update_depth_gradient(bids, asks)
+
+                # Feed flow predictor (trains on 5-tick-ahead outcomes)
+                ps.predictor.observe({
+                    "ofi": ps.last_ofi,
+                    "obi": ps.ofi_tracker.obi,
+                    "depth_pressure": ps.ofi_tracker.depth_pressure,
+                    "toxicity": ps.ofi_tracker.toxicity,
+                    "arrival": ps.ofi_tracker.arrival_intensity,
+                    "momentum": ps._momentum / 5.0,  # normalize
+                }, mid)
 
                 # Track OFI direction stability for anti-adverse-selection
                 curr_sign = 1 if ps.last_ofi > 0.1 else (-1 if ps.last_ofi < -0.1 else 0)
@@ -780,7 +799,15 @@ async def run_pair(symbol: str):
                     mom_req = sp["mom_req"]  # session-adaptive momentum requirement
                     # Anti-adverse-selection: require OFI stable for 2+ ticks (~200ms)
                     signal_stable = ps._ofi_stable_ticks >= 2
-                    if ps.last_ofi > buy_thresh and ps._momentum >= mom_req and tox_confirms_buy and signal_stable:
+                    # Flow prediction filter: skip if model disagrees (>60% confident opposite)
+                    pred_dir, pred_conf = ps.predictor.predict({
+                        "ofi": ps.last_ofi, "obi": obi, "depth_pressure": dp,
+                        "toxicity": tox, "arrival": ps.ofi_tracker.arrival_intensity,
+                        "momentum": ps._momentum / 5.0,
+                    })
+                    pred_ok_buy = not ps.predictor.ready or pred_dir > 0 or pred_conf < 0.6
+                    pred_ok_sell = not ps.predictor.ready or pred_dir < 0 or pred_conf < 0.6
+                    if ps.last_ofi > buy_thresh and ps._momentum >= mom_req and tox_confirms_buy and signal_stable and pred_ok_buy:
                         # Scale size by spread width (wider spread = more edge = bigger size)
                         spread_mult = min(2.0, max(0.5, ps.last_spread_bps / 5.0))
                         adj_size = size * spread_mult * sp["size_mult"]
@@ -800,7 +827,7 @@ async def run_pair(symbol: str):
                         ps._entry_signals = sigs
                         _track_exec(symbol, best_ask, mid, "buy")
                         log(f"[{symbol}] BUY ${adj_size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
-                    elif ps.last_ofi < sell_thresh and ps._momentum <= -mom_req and tox_confirms_sell and signal_stable:
+                    elif ps.last_ofi < sell_thresh and ps._momentum <= -mom_req and tox_confirms_sell and signal_stable and pred_ok_sell:
                         spread_mult = min(2.0, max(0.5, ps.last_spread_bps / 5.0))
                         adj_size = size * spread_mult * sp["size_mult"]
                         ps.position = -adj_size
