@@ -358,6 +358,18 @@ def _get_metrics() -> dict:
         metrics["_order_templates"] = get_cache().get_metrics()
     except (ImportError, Exception):
         pass
+    # Adaptive fee model metrics
+    try:
+        from fee_model import get_fee_model
+        metrics["_fee_model"] = get_fee_model().get_metrics()
+    except (ImportError, Exception):
+        pass
+    # Portfolio risk metrics (correlation matrix, VaR)
+    try:
+        from portfolio_risk import get_portfolio_risk
+        metrics["_portfolio_risk"] = get_portfolio_risk().get_metrics()
+    except (ImportError, Exception):
+        pass
     return metrics
 
 

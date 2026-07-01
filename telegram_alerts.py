@@ -42,6 +42,29 @@ def alert_arb(question: str, total_cost: float, profit_usd: float):
     send(f"💰 <b>ARB FOUND</b>\n{question}\nCost: ${total_cost:.4f} | Profit: ${profit_usd:.2f}")
 
 
+def alert_event(event_type: str, severity: float, action: str, details: str, symbol: str = ""):
+    """Alert on market microstructure event (liquidation cascade, flash crash, etc.)."""
+    # Only alert on significant events (severity > 0.5)
+    if severity < 0.5:
+        return
+    emoji_map = {
+        "liquidation_cascade": "🌊",
+        "flash_crash": "⚡",
+        "whale_accumulation": "🐋",
+        "funding_spike": "📈",
+        "exchange_halt_risk": "🚨",
+    }
+    emoji = emoji_map.get(event_type, "⚠️")
+    action_emoji = {"pause": "⏸️", "exit_all": "🛑", "reduce": "📉", "widen_spread": "↔️"}.get(action, "")
+    sym_str = f" [{symbol}]" if symbol else ""
+    send(
+        f"{emoji} <b>EVENT{sym_str}</b>\n"
+        f"Type: {event_type.replace('_', ' ').title()}\n"
+        f"Severity: {severity:.0%} | Action: {action_emoji} {action}\n"
+        f"<code>{details}</code>"
+    )
+
+
 async def daily_summary_loop():
     """Send comprehensive daily P&L report at 23:59 TW time."""
     global _last_daily

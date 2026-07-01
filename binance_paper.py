@@ -511,6 +511,15 @@ def _record(ps: PairState, profit: float):
     exit_fee = trade_value * EXIT_FEE_BPS / 10000
     net_profit = profit - entry_fee - exit_fee
 
+    # Track in adaptive fee model for accurate cost estimation
+    try:
+        from fee_model import get_fee_model
+        fm = get_fee_model()
+        fm.record_fill(trade_value, is_maker=False, strategy="binance_mm")   # entry = taker
+        fm.record_fill(trade_value, is_maker=True, strategy="binance_mm")    # exit = maker
+    except (ImportError, Exception):
+        pass
+
     ps.pnl += net_profit
     ps.fills += 1
     daily_pnl += net_profit
@@ -596,6 +605,15 @@ async def run_pair(symbol: str):
                 mid = (best_bid + best_ask) / 2
                 ps.mid_prices.append(mid)
                 ps.last_spread_bps = (best_ask - best_bid) / mid * 10000
+
+                # Portfolio risk: update price + position for VaR calculation
+                try:
+                    from portfolio_risk import get_portfolio_risk
+                    pr = get_portfolio_risk()
+                    pr.update_price(symbol, mid)
+                    pr.update_position(symbol, ps.position)
+                except (ImportError, Exception):
+                    pass
 
                 # Track returns for BTC-ETH correlation
                 if ps._prev_mid > 0 and mid > 0:
@@ -1001,7 +1019,16 @@ async def _aggtrade_stream():
                     ps.ofi_tracker.update_trade(px * qty, is_buyer_maker, float(data.get("T", 0)))
                     # Feed event detector (liquidation cascades, flash crashes, whale detection)
                     mid = ps.ofi_tracker._last_bid_top if hasattr(ps.ofi_tracker, '_last_bid_top') else px
+                    prev_events = len(ps.events.active_events)
                     ps.events.update_trade(mid, px * qty, is_buyer_maker)
+                    # Telegram alert on new significant events
+                    if len(ps.events.active_events) > prev_events:
+                        newest = ps.events.active_events[-1]
+                        try:
+                            from telegram_alerts import alert_event
+                            alert_event(newest.event_type, newest.severity, newest.action, newest.details, symbol)
+                        except Exception:
+                            pass
         except (websockets.ConnectionClosed, OSError, Exception) as e:
             ws_state.on_disconnect()
             delay = ws_state.next_backoff()

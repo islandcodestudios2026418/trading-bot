@@ -85,6 +85,16 @@ def _check_divergence(symbol: str):
     """Check if Binance-OKX spread z-score exceeds threshold (cointegration mean-reversion)."""
     global _pnl, _trades
 
+    # Graceful degradation: skip if either WS is stale
+    try:
+        from ws_manager import _connections
+        bn_ws = _connections.get("cross-arb-binance")
+        okx_ws = _connections.get("cross-arb-okx")
+        if (bn_ws and bn_ws.stale) or (okx_ws and okx_ws.stale):
+            return  # one venue down — unsafe to arb
+    except Exception:
+        pass
+
     b_mid = _binance_mids.get(symbol, 0)
     okx_inst = _symbol_to_okx(symbol)
     o_mid = _okx_mids.get(okx_inst, 0)
@@ -128,12 +138,28 @@ def _check_divergence(symbol: str):
         z_score = div_bps / max(1, adaptive_trigger)  # pseudo z-score
 
     # Depth-aware sizing: don't trade more than 30% of available depth
+    # Use L2 book reconstruction if available (more accurate than snapshots)
     depth = _binance_depth.get(symbol, (0, 0))
+    try:
+        from l2_book import get_manager
+        mgr = get_manager()
+        book = mgr.get_book(symbol)
+        if book and book._initialized and book.mid > 0:
+            # Use L2 reconstructed depth (more accurate, real-time)
+            l2_bid_depth, l2_ask_depth = book.depth_at_bps(10)  # depth within 10bps
+            if l2_bid_depth > 0 or l2_ask_depth > 0:
+                depth = (l2_bid_depth, l2_ask_depth)
+    except (ImportError, Exception):
+        pass
+
     side = "buy" if div_bps > 0 else "sell"
     available_depth = depth[0] if side == "buy" else depth[1]
     if available_depth > 0:
         max_size = available_depth * 0.3
         trade_size = min(SIZE_USD, max_size)
+        # Smart routing: skip if insufficient depth (< $10 available)
+        if available_depth < 10:
+            return  # book too thin, skip this arb
     else:
         trade_size = SIZE_USD
 
@@ -184,6 +210,14 @@ async def _stream_okx():
                         ask = float(d.get("askPx", 0))
                         if bid > 0 and ask > 0:
                             _okx_mids[inst] = (bid + ask) / 2
+                            # Feed multi-venue price index (OKX weight=1)
+                            try:
+                                from price_index import index as px_index
+                                # Convert OKX instId back to symbol for index
+                                sym = inst.replace("-", "").replace("USDT", "") + "USDT"
+                                px_index.update("okx", sym, _okx_mids[inst], weight=1.0)
+                            except Exception:
+                                pass
         except Exception as e:
             ws_state.on_disconnect()
             delay = ws_state.next_backoff()
@@ -213,6 +247,12 @@ async def _stream_binance():
                         continue
                     mid = (float(bids[0][0]) + float(asks[0][0])) / 2
                     _binance_mids[symbol] = mid
+                    # Feed multi-venue price index (Binance weight=2 — deeper market)
+                    try:
+                        from price_index import index as px_index
+                        px_index.update("binance", symbol, mid, weight=2.0)
+                    except Exception:
+                        pass
                     # Track depth for sizing
                     bid_depth = sum(float(b[0]) * float(b[1]) for b in bids)
                     ask_depth = sum(float(a[0]) * float(a[1]) for a in asks)
