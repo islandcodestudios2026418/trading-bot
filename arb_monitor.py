@@ -273,6 +273,7 @@ def _get_metrics() -> dict:
             metrics[sym] = {
                 "ofi": round(ps.last_ofi, 4),
                 "obi": round(ot.obi, 4),
+                "obi_momentum": round(ot.obi_momentum, 5),
                 "vpin": round(ot.vpin, 4),
                 "toxicity": round(ot.toxicity, 4),
                 "arrival_intensity": round(ot.arrival_intensity, 2),
@@ -283,12 +284,17 @@ def _get_metrics() -> dict:
                 "kyle_lambda": round(ot.kyle_lambda, 4),
                 "micro_state": ot.micro_state,
                 "regime": ps.regime.regime,
+                "regime_confidence": round(getattr(ps.regime, 'confidence', 0), 3),
+                "regime_accuracy": round(getattr(ps.regime, 'accuracy', 0), 3),
                 "vr": round(ps.regime.vr, 3),
                 "hurst": round(ps.regime.hurst, 3),
+                "autocorr": round(getattr(ps.regime, '_autocorr', 0), 3),
                 "spread_bps": round(ps.last_spread_bps, 1),
                 "atr": round(ps.last_atr, 6),
                 "position": round(ps.position, 2),
                 "predictor": ps.predictor.status(),
+                "event_action": ps.events.recommended_action if hasattr(ps, 'events') else "none",
+                "event_severity": round(ps.events.max_severity, 3) if hasattr(ps, 'events') else 0,
             }
     except (ImportError, Exception):
         pass
@@ -315,6 +321,41 @@ def _get_metrics() -> dict:
     try:
         from capital_alloc import allocator
         metrics["_capital_alloc"] = allocator.status()
+    except (ImportError, Exception):
+        pass
+    # Regime ML model metrics
+    try:
+        from binance_paper import pair_states as _ps2
+        ml_metrics = {}
+        for sym, ps in _ps2.items():
+            if hasattr(ps.regime, 'get_metrics'):
+                ml_metrics[sym] = ps.regime.get_metrics()
+        if ml_metrics:
+            metrics["_regime_ml"] = ml_metrics
+    except (ImportError, Exception):
+        pass
+    # L2 Order Book reconstruction metrics
+    try:
+        from l2_book import get_manager
+        mgr = get_manager()
+        metrics["_l2_book"] = mgr.get_all_metrics()
+    except (ImportError, Exception):
+        pass
+    # Event detector metrics (liquidation cascades, flash crashes, etc.)
+    try:
+        from binance_paper import pair_states as _ps3
+        event_metrics = {}
+        for sym, ps in _ps3.items():
+            if hasattr(ps, 'events'):
+                event_metrics[sym] = ps.events.get_metrics()
+        if event_metrics:
+            metrics["_events"] = event_metrics
+    except (ImportError, Exception):
+        pass
+    # Order template cache metrics
+    try:
+        from order_templates import get_cache
+        metrics["_order_templates"] = get_cache().get_metrics()
     except (ImportError, Exception):
         pass
     return metrics

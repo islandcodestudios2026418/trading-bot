@@ -13,6 +13,7 @@ from okx_mm import run as okx_mm_run
 from funding_monitor import run as funding_run
 from cross_arb import run as cross_arb_run
 from tick_recorder import run as tick_recorder_run
+from l2_book import run as l2_book_run
 from telegram_alerts import daily_summary_loop, send as tg_send
 
 HEALTH_INTERVAL = 300  # log status every 5 min
@@ -20,7 +21,7 @@ _start_time = time.time()
 
 
 async def supervised(name: str, coro_fn):
-    """Run a coroutine with automatic restart on crash."""
+    """Run a coroutine with automatic restart on crash. Per-strategy isolation."""
     while True:
         try:
             await coro_fn()
@@ -28,6 +29,7 @@ async def supervised(name: str, coro_fn):
             raise
         except Exception as e:
             log(f"⚠️ [{name}] crashed: {e} — restarting in 10s")
+            tg_send(f"⚠️ {name} crashed: {e} — auto-restarting")
             await asyncio.sleep(10)
 
 
@@ -87,6 +89,7 @@ async def main():
         supervised("Funding", funding_run),
         supervised("Cross-Arb", cross_arb_run),
         supervised("Tick-Recorder", tick_recorder_run),
+        supervised("L2-Book", l2_book_run),
         health_monitor(),
         daily_summary_loop(),
     )

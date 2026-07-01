@@ -11,9 +11,10 @@ from datetime import datetime, timezone, timedelta
 
 import websockets
 
-from regime import RegimeDetector
+from regime_ml import RegimeMLDetector as RegimeDetector
 from ws_manager import register as ws_register
 from flow_predict import FlowPredictor
+from event_detector import EventDetector
 
 try:
     from signal_attrib import attrib
@@ -154,6 +155,7 @@ class OFITracker:
     arrival_intensity: float = 1.0  # current_rate / baseline_rate, >2.0 = informed surge
     # Order book imbalance (OBI): shallow levels 1-5
     obi: float = 0.0  # [-1,+1]: +1 = all bids, useful as alpha confirmation
+    obi_momentum: float = 0.0  # dOBI/dt: rate of change of OBI (EMA-smoothed)
     # Market impact estimator: Kyle's lambda
     _adv_ema: float = 0.0  # average daily volume (USD) EMA
     _adv_alpha: float = 0.001  # slow-moving EMA
@@ -189,7 +191,11 @@ class OFITracker:
         shallow_bid = sum(float(b[1]) * float(b[0]) for b in bids[:5])
         shallow_ask = sum(float(a[1]) * float(a[0]) for a in asks[:5])
         raw_obi = (shallow_bid - shallow_ask) / (shallow_bid + shallow_ask) if (shallow_bid + shallow_ask) > 0 else 0
+        prev_obi = self.obi
         self.obi += 0.1 * (raw_obi - self.obi)  # smooth
+        # OBI momentum: rate of change (EMA-smoothed derivative)
+        dobi = self.obi - prev_obi
+        self.obi_momentum += 0.2 * (dobi - self.obi_momentum)
 
         # Kyle's lambda: estimate price impact from book depth
         # Lambda ≈ spread / (2 * depth_at_best_5_levels_USD)
@@ -385,6 +391,8 @@ class PairState:
     regime: RegimeDetector = field(default_factory=RegimeDetector)
     # Flow prediction model (5-tick lookahead)
     predictor: FlowPredictor = field(default_factory=FlowPredictor)
+    # Microstructure event detection (liquidation cascades, flash crashes, etc.)
+    events: EventDetector = field(default_factory=EventDetector)
 
     @property
     def wr(self):
@@ -666,9 +674,22 @@ async def run_pair(symbol: str):
                 buy_thresh = ofi_threshold + inv_skew
                 sell_thresh = -ofi_threshold + inv_skew
 
-                # Regime detection: adapt thresholds
-                ps.regime.update(mid)
+                # Regime detection: adapt thresholds (ML ensemble with VR+Hurst fallback)
+                ps.regime.update(mid,
+                                 spread_bps=spread_bps if spread_bps else 0,
+                                 arrival_intensity=ps.ofi_tracker.arrival_intensity,
+                                 ofi_composite=ps.last_ofi)
                 buy_thresh, sell_thresh = ps.regime.adapt_thresholds(buy_thresh, sell_thresh)
+
+                # Event detector: book-level updates (halt risk, depth anomalies)
+                bid_d = sum(float(b[1]) * float(b[0]) for b in bids[:10]) if bids else 0
+                ask_d = sum(float(a[1]) * float(a[0]) for a in asks[:10]) if asks else 0
+                ps.events.update_book(bid_d, ask_d, spread_bps if spread_bps else 0)
+
+                # Event-based spread widening + entry gating
+                if ps.events.should_skip_entry():
+                    # Active protective event — skip new entries this tick
+                    pass  # fall through to exit logic only
 
                 # Session adaptation: Asian=ranging(strict), US=trending(easy)
                 global _current_session
@@ -772,6 +793,13 @@ async def run_pair(symbol: str):
                     buy_thresh *= 0.85
                 elif obi < -0.15:   # asks dominating → easier short
                     sell_thresh *= 0.85
+
+                # OBI momentum: rising OBI = new liquidity arriving, stronger signal
+                obi_mom = ps.ofi_tracker.obi_momentum
+                if obi_mom > 0.005:   # OBI accelerating bullish
+                    buy_thresh *= 0.9
+                elif obi_mom < -0.005:  # OBI accelerating bearish
+                    sell_thresh *= 0.9
 
                 # Spoofing detection: if detected, increase threshold (less reliable book)
                 if ps.ofi_tracker.spoof_score > 0.5:
@@ -971,6 +999,9 @@ async def _aggtrade_stream():
                     qty = float(data.get("q", 0))
                     is_buyer_maker = data.get("m", False)
                     ps.ofi_tracker.update_trade(px * qty, is_buyer_maker, float(data.get("T", 0)))
+                    # Feed event detector (liquidation cascades, flash crashes, whale detection)
+                    mid = ps.ofi_tracker._last_bid_top if hasattr(ps.ofi_tracker, '_last_bid_top') else px
+                    ps.events.update_trade(mid, px * qty, is_buyer_maker)
         except (websockets.ConnectionClosed, OSError, Exception) as e:
             ws_state.on_disconnect()
             delay = ws_state.next_backoff()

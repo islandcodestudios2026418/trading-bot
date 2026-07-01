@@ -19,6 +19,7 @@ from okx_client import (
 )
 from risk_manager import RiskManager
 from ws_manager import register as ws_register
+from order_templates import get_cache as get_template_cache
 
 TW_TZ = timezone(timedelta(hours=8))
 
@@ -51,6 +52,8 @@ class OKXWSMarketMaker:
         self.last_scan = 0.0
         self.pnl = 0.0
         self.fills_count = 0
+        # Pre-computed order templates for latency optimization
+        self._templates = get_template_cache()
         # Per-instrument state
         self._books: dict[str, dict] = {}  # instId → {bid, ask, mid}
         self._last_quote_mid: dict[str, float] = {}  # mid at last quote
@@ -201,10 +204,7 @@ class OKXWSMarketMaker:
         cancel_all(inst_id)
         self._orders = {k: v for k, v in self._orders.items() if v.get("instId") != inst_id}
 
-        orders = [
-            {"instId": inst_id, "tdMode": "cash", "side": "buy", "ordType": "post_only", "sz": qty_str, "px": bid_px},
-            {"instId": inst_id, "tdMode": "cash", "side": "sell", "ordType": "post_only", "sz": qty_str, "px": ask_px},
-        ]
+        orders = self._templates.make_quote_pair(inst_id, our_bid, our_ask, size_usd, prefix="mm")
         result = batch_orders(orders)
         placed = 0
         if result.get("code") == "0":
@@ -384,6 +384,14 @@ class OKXWSMarketMaker:
             ok, _ = self.rm.can_trade()
             if not ok:
                 continue
+            # Graceful degradation: skip if book WS is stale
+            try:
+                from ws_manager import _connections
+                ws = _connections.get("okx-orderbook")
+                if ws and ws.stale:
+                    continue  # no fresh data — don't trade
+            except Exception:
+                pass
             for inst in self.active_pairs:
                 if self._should_requote(inst):
                     self._quote_pair(inst)
