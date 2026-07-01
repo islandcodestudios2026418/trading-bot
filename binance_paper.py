@@ -16,6 +16,9 @@ from ws_manager import register as ws_register
 from flow_predict import FlowPredictor
 from event_detector import EventDetector
 from vol_cluster import VolCluster
+from anti_gaming import AntiGaming
+from trade_journal import get_journal
+from inactivity import get_inactivity_monitor
 
 try:
     from signal_attrib import attrib
@@ -396,6 +399,8 @@ class PairState:
     events: EventDetector = field(default_factory=EventDetector)
     # Volatility clustering (GARCH-like vol-of-vol detection)
     vol_cluster: VolCluster = field(default_factory=VolCluster)
+    # Anti-gaming (layering, momentum ignition, spoofing detection)
+    anti_gaming: AntiGaming = field(default_factory=AntiGaming)
 
     @property
     def wr(self):
@@ -570,6 +575,12 @@ def _record(ps: PairState, profit: float):
     # Alert every 10th fill or on significant loss
     if daily_fills % 10 == 0 or profit < -0.01:
         alert_trade(ps.symbol, "FILL", profit, daily_pnl)
+    # Trade journal: record exit
+    get_journal().record_exit(ps.symbol, ps.entry_price, net_profit,
+                             exit_reason="signal_flip",
+                             active_signals=list(ps._entry_signals.keys()) if ps._entry_signals else [])
+    # Inactivity monitor: record fill
+    get_inactivity_monitor().record_fill(ps.symbol)
 
 
 async def run_pair(symbol: str):
@@ -643,6 +654,12 @@ async def run_pair(symbol: str):
                 ps.last_ofi = ps.ofi_tracker.update(bid_vol, ask_vol)
                 ps.ofi_tracker.update_depth_gradient(bids, asks)
 
+                # Anti-gaming: detect layering, spoofing, momentum ignition
+                ps.anti_gaming.update(mid, bids, asks)
+
+                # Inactivity monitor: record depth update (proves connectivity)
+                get_inactivity_monitor().record_depth(symbol)
+
                 # Feed flow predictor (trains on 5-tick-ahead outcomes)
                 ps.predictor.observe({
                     "ofi": ps.last_ofi,
@@ -711,6 +728,19 @@ async def run_pair(symbol: str):
                 if ps.events.should_skip_entry():
                     # Active protective event — skip new entries this tick
                     pass  # fall through to exit logic only
+
+                # Anti-gaming: if gaming detected, skip entry and widen spread
+                if ps.anti_gaming.should_pause:
+                    pass  # skip entries during gaming detection
+                elif ps.anti_gaming.spread_multiplier > 1.0:
+                    buy_thresh *= ps.anti_gaming.spread_multiplier
+                    sell_thresh *= ps.anti_gaming.spread_multiplier
+
+                # Inactivity recovery: loosen thresholds if no fills for too long
+                inact_mult = get_inactivity_monitor().get_threshold_multiplier(symbol)
+                if inact_mult < 1.0:
+                    buy_thresh *= inact_mult
+                    sell_thresh *= inact_mult
 
                 # Volatility clustering: update and adjust thresholds/sizing
                 ps.vol_cluster.update(mid)
@@ -901,6 +931,20 @@ async def run_pair(symbol: str):
                         ps._entry_signals = sigs
                         _track_exec(symbol, best_ask, mid, "buy")
                         log(f"[{symbol}] BUY ${adj_size:.0f} @ {best_ask} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
+                        # Trade journal + inactivity tracking
+                        get_journal().record_entry(symbol, "buy", best_ask, adj_size, signals={
+                            "ofi": ps.last_ofi, "obi": obi, "obi_momentum": ps.ofi_tracker.obi_momentum,
+                            "vpin": vpin, "toxicity": ps.ofi_tracker.toxicity,
+                            "arrival_intensity": ps.ofi_tracker.arrival_intensity,
+                            "volume_surge": ps.ofi_tracker.volume_surge,
+                            "depth_pressure": dp, "spoof_score": ps.ofi_tracker.spoof_score,
+                            "regime": ps.regime.regime, "regime_confidence": ps.regime.confidence,
+                            "vr": ps.regime.vr, "hurst": ps.regime.hurst,
+                            "vol_state": ps.vol_cluster.state, "vol_bps": ps.vol_cluster.realized_vol_bps,
+                            "spread_bps": ps.last_spread_bps, "micro_state": ps.ofi_tracker.micro_state,
+                            "session": _current_session, "momentum": ps._momentum,
+                        })
+                        get_inactivity_monitor().register_symbol(symbol)
                     elif ps.last_ofi < sell_thresh and ps._momentum <= -mom_req and tox_confirms_sell and signal_stable and pred_ok_sell:
                         spread_mult = min(2.0, max(0.5, ps.last_spread_bps / 5.0))
                         adj_size = size * spread_mult * sp["size_mult"]
@@ -920,6 +964,20 @@ async def run_pair(symbol: str):
                         ps._entry_signals = sigs
                         _track_exec(symbol, best_bid, mid, "sell")
                         log(f"[{symbol}] SELL ${adj_size:.0f} @ {best_bid} OFI={ps.last_ofi:.2f} mom={ps._momentum} reg={ps.regime.regime[0]}")
+                        # Trade journal + inactivity tracking
+                        get_journal().record_entry(symbol, "sell", best_bid, adj_size, signals={
+                            "ofi": ps.last_ofi, "obi": obi, "obi_momentum": ps.ofi_tracker.obi_momentum,
+                            "vpin": vpin, "toxicity": ps.ofi_tracker.toxicity,
+                            "arrival_intensity": ps.ofi_tracker.arrival_intensity,
+                            "volume_surge": ps.ofi_tracker.volume_surge,
+                            "depth_pressure": dp, "spoof_score": ps.ofi_tracker.spoof_score,
+                            "regime": ps.regime.regime, "regime_confidence": ps.regime.confidence,
+                            "vr": ps.regime.vr, "hurst": ps.regime.hurst,
+                            "vol_state": ps.vol_cluster.state, "vol_bps": ps.vol_cluster.realized_vol_bps,
+                            "spread_bps": ps.last_spread_bps, "micro_state": ps.ofi_tracker.micro_state,
+                            "session": _current_session, "momentum": ps._momentum,
+                        })
+                        get_inactivity_monitor().register_symbol(symbol)
 
                 elif ps.position > 0:
                     # Position aging: force exit after 60s if not profitable

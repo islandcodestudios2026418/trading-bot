@@ -387,6 +387,35 @@ def _get_metrics() -> dict:
         metrics["_fill_analytics"] = get_fill_tracker().get_metrics()
     except (ImportError, Exception):
         pass
+    # Anti-gaming detection metrics
+    try:
+        from binance_paper import pair_states as _ps5
+        gaming_metrics = {}
+        for sym, ps in _ps5.items():
+            if hasattr(ps, 'anti_gaming'):
+                gaming_metrics[sym] = ps.anti_gaming.get_metrics()
+        if gaming_metrics:
+            metrics["_anti_gaming"] = gaming_metrics
+    except (ImportError, Exception):
+        pass
+    # Trade journal metrics
+    try:
+        from trade_journal import get_journal
+        metrics["_trade_journal"] = get_journal().get_metrics()
+    except (ImportError, Exception):
+        pass
+    # Inactivity monitor metrics
+    try:
+        from inactivity import get_inactivity_monitor
+        metrics["_inactivity"] = get_inactivity_monitor().get_metrics()
+    except (ImportError, Exception):
+        pass
+    # Funding rate relative value
+    try:
+        from funding_rv import get_funding_rv
+        metrics["_funding_rv"] = get_funding_rv().get_metrics()
+    except (ImportError, Exception):
+        pass
     return metrics
 
 

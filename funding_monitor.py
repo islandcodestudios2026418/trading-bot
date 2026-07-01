@@ -63,6 +63,12 @@ def scan_extreme_rates() -> list[dict]:
     for r in rates:
         inst_id = r.get("instId", "")
         rate = float(r.get("fundingRate", "0"))
+        # Feed funding rate relative value detector
+        try:
+            from funding_rv import get_funding_rv
+            get_funding_rv().update_rate(inst_id, rate)
+        except (ImportError, Exception):
+            pass
         if abs(rate) * 100 >= RATE_THRESHOLD:
             apr = rate * 3 * 365 * 100
             extreme.append({
