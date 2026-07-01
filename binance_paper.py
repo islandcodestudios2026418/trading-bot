@@ -15,6 +15,7 @@ from regime_ml import RegimeMLDetector as RegimeDetector
 from ws_manager import register as ws_register
 from flow_predict import FlowPredictor
 from event_detector import EventDetector
+from vol_cluster import VolCluster
 
 try:
     from signal_attrib import attrib
@@ -393,6 +394,8 @@ class PairState:
     predictor: FlowPredictor = field(default_factory=FlowPredictor)
     # Microstructure event detection (liquidation cascades, flash crashes, etc.)
     events: EventDetector = field(default_factory=EventDetector)
+    # Volatility clustering (GARCH-like vol-of-vol detection)
+    vol_cluster: VolCluster = field(default_factory=VolCluster)
 
     @property
     def wr(self):
@@ -708,6 +711,31 @@ async def run_pair(symbol: str):
                 if ps.events.should_skip_entry():
                     # Active protective event — skip new entries this tick
                     pass  # fall through to exit logic only
+
+                # Volatility clustering: update and adjust thresholds/sizing
+                ps.vol_cluster.update(mid)
+                buy_thresh *= ps.vol_cluster.entry_threshold_mult()
+                sell_thresh *= ps.vol_cluster.entry_threshold_mult()
+
+                # OBI momentum alpha: rapid OBI changes predict short-term moves
+                obi_mom = ps.ofi_tracker.obi_momentum
+                if abs(obi_mom) > 0.005:  # significant OBI acceleration
+                    if obi_mom > 0.005:
+                        buy_thresh *= 0.85  # OBI accelerating bullish → easier long
+                    elif obi_mom < -0.005:
+                        sell_thresh *= 0.85  # OBI accelerating bearish → easier short
+
+                # Portfolio VaR gating: check before allowing new entries
+                try:
+                    from portfolio_risk import get_portfolio_risk
+                    pr = get_portfolio_risk()
+                    if ps.position == 0:  # only gate new entries, not exits
+                        allowed, reason = pr.should_allow_trade(symbol, size, max_var_usd=float(os.getenv("MAX_VAR_USD", "50")))
+                        if not allowed:
+                            buy_thresh *= 2.0  # much harder to enter (effectively blocks)
+                            sell_thresh *= 2.0
+                except (ImportError, Exception):
+                    pass
 
                 # Session adaptation: Asian=ranging(strict), US=trending(easy)
                 global _current_session

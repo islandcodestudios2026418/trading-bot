@@ -370,6 +370,23 @@ def _get_metrics() -> dict:
         metrics["_portfolio_risk"] = get_portfolio_risk().get_metrics()
     except (ImportError, Exception):
         pass
+    # Volatility clustering metrics
+    try:
+        from binance_paper import pair_states as _ps4
+        vol_metrics = {}
+        for sym, ps in _ps4.items():
+            if hasattr(ps, 'vol_cluster'):
+                vol_metrics[sym] = ps.vol_cluster.get_metrics()
+        if vol_metrics:
+            metrics["_vol_cluster"] = vol_metrics
+    except (ImportError, Exception):
+        pass
+    # Fill-time analytics
+    try:
+        from fill_analytics import get_fill_tracker
+        metrics["_fill_analytics"] = get_fill_tracker().get_metrics()
+    except (ImportError, Exception):
+        pass
     return metrics
 
 

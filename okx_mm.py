@@ -20,6 +20,7 @@ from okx_client import (
 from risk_manager import RiskManager
 from ws_manager import register as ws_register
 from order_templates import get_cache as get_template_cache
+from fill_analytics import get_fill_tracker
 
 TW_TZ = timezone(timedelta(hours=8))
 
@@ -216,6 +217,9 @@ class OKXWSMarketMaker:
                     px = our_bid if i == 0 else our_ask
                     if oid:
                         self._orders[oid] = {"instId": inst_id, "side": side, "px": px, "sz": qty}
+                        # Fill-time analytics: record quote placement
+                        edge = abs(px - mid) / mid * 10000 if mid > 0 else 0
+                        get_fill_tracker().quote_placed(oid, inst_id, side, edge)
 
         if placed > 0:
             self.rm.add_exposure(size_usd)
@@ -228,6 +232,11 @@ class OKXWSMarketMaker:
         """Process fill from private WS orders channel + adapt edge."""
         state = data.get("state", "")
         if state != "filled" and state != "partially_filled":
+            # Track cancellations for fill-rate analytics
+            if state == "canceled":
+                ord_id = data.get("ordId", "")
+                if ord_id:
+                    get_fill_tracker().quote_cancelled(ord_id)
             return
 
         inst = data.get("instId", "")
@@ -236,9 +245,15 @@ class OKXWSMarketMaker:
         fill_sz = float(data.get("fillSz") or data.get("accFillSz") or "0")
         fee = float(data.get("fee") or "0")
         exec_type = data.get("execType", "")  # M=maker, T=taker
+        ord_id = data.get("ordId", "")
 
         if not inst or fill_px <= 0:
             return
+
+        # Fill-time analytics: record fill
+        if ord_id:
+            mid = self._books.get(inst, {}).get("mid", fill_px)
+            get_fill_tracker().quote_filled(ord_id, mid, fill_px)
 
         # Maker/taker tracking for rebate optimization
         is_maker = exec_type == "M" or fee <= 0  # negative fee = rebate = maker
